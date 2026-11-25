@@ -77,6 +77,11 @@ pub fn default_headers(user_agent: &str) -> HeaderMap {
 /// Initialize an HTTP client with the given cookie jar.
 pub async fn init_http(ctx: &ContextBase, cookie_store: Arc<CookieStoreMutex>) -> Result<()> {
     let client = reqwest::Client::builder()
+        .tcp_nodelay(true)
+        .connect_timeout(Duration::from_secs(5))
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(32)
         .cookie_provider(cookie_store.clone())
         .gzip(true)
         .brotli(true)
