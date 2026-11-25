@@ -15,6 +15,8 @@
 //! shared reqwest cookie store and returned in [`LoginQrResult`].
 
 use base64::engine::{general_purpose::STANDARD, Engine as _};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, REFERER};
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::{Duration, timeout};
@@ -174,16 +176,168 @@ fn extract_login_version(html: &str) -> Option<String> {
 /// Discover the login page JS version.
 pub async fn load_login_page(ctx: &ContextBase) -> Result<String> {
     let url = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F";
-    let res = http::get(ctx, url).await?;
+    let res = http::request(ctx, Method::GET, url, None, Some(qr_page_headers()), false).await?;
     let html = res.text().await?;
     extract_login_version(&html).ok_or_else(|| {
         ZaloError::Api(ZaloApiError::new("Cannot get API login version"))
     })
 }
 
-async fn post_id_form(ctx: &ContextBase, url: &str, params: &[(&str, &str)]) -> Result<Value> {
+// --- Browser fingerprint headers (ported 1:1 from zca-js loginQR.js) ---
+//
+// The working JS bot (zalo-client / zca-js) sends full Chrome browser
+// headers on every QR-login request. The previous Rust code only sent the
+// generic API defaults (Accept: application/json, Accept-Language: en-US,
+// Referer: chat.zalo.me, no sec-ch-ua / sec-fetch-* at all), so Zalo's
+// server rejected QR generation with error_code=-4 "Truy cập không hợp lệ"
+// even though the version and the User-Agent were correct.
+// These builders reproduce zca-js's per-request headers exactly, so the
+// Rust requests are indistinguishable from the working JS ones.
+
+const SEC_CH_UA: &str = "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"";
+const ACCEPT_LANG: &str = "vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5";
+const REFERRER_POLICY: &str = "strict-origin-when-cross-origin";
+const LOGININFO_REFERER: &str =
+    "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc";
+const WAITING_REFERER: &str =
+    "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F";
+const NAV_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
+
+fn hv(value: &str) -> HeaderValue {
+    HeaderValue::from_str(value).expect("static header value")
+}
+
+fn sec_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        HeaderName::from_static("sec-ch-ua"),
+        hv(SEC_CH_UA),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-ch-ua-mobile"),
+        hv("?0"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-ch-ua-platform"),
+        hv("\"Windows\""),
+    );
+}
+
+fn base_browser_headers(headers: &mut HeaderMap) {
+    headers.insert(ACCEPT_LANGUAGE, hv(ACCEPT_LANG));
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        hv(REFERRER_POLICY),
+    );
+    sec_headers(headers);
+}
+
+/// Navigation (document) headers for `load_login_page` and `check_session`.
+/// Mirrors zca-js: `accept` is the full browser document list, `sec-fetch-*`
+/// describes a top-level navigation, `priority: u=0, i`.
+fn qr_page_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, hv(NAV_ACCEPT));
+    headers.insert(REFERER, hv("https://chat.zalo.me/"));
+    headers.insert(
+        HeaderName::from_static("cache-control"),
+        hv("max-age=0"),
+    );
+    headers.insert(HeaderName::from_static("priority"), hv("u=0, i"));
+    headers.insert(
+        HeaderName::from_static("sec-fetch-dest"),
+        hv("document"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-mode"),
+        hv("navigate"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-site"),
+        hv("same-site"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-user"),
+        hv("?1"),
+    );
+    headers.insert(
+        HeaderName::from_static("upgrade-insecure-requests"),
+        hv("1"),
+    );
+    base_browser_headers(&mut headers);
+    headers
+}
+
+/// POST headers for the id.zalo.me account endpoints, mirroring zca-js:
+/// `accept: */*`, `sec-fetch-*` for a CORS fetch, `priority: u=1, i`,
+/// and the endpoint-specific `Referer` the JS flow sends.
+fn qr_post_headers(referer: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, hv("*/*"));
+    headers.insert(REFERER, hv(referer));
+    headers.insert(HeaderName::from_static("priority"), hv("u=1, i"));
+    headers.insert(
+        HeaderName::from_static("sec-fetch-dest"),
+        hv("empty"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-mode"),
+        hv("cors"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-site"),
+        hv("same-origin"),
+    );
+    base_browser_headers(&mut headers);
+    headers
+}
+
+/// GET headers for `check_session` (document navigation from the login page).
+fn qr_session_headers() -> HeaderMap {
+    let mut headers = qr_page_headers();
+    headers.insert(REFERER, hv(WAITING_REFERER));
+    headers.insert(
+        HeaderName::from_static("sec-fetch-site"),
+        hv("same-origin"),
+    );
+    headers.remove(HeaderName::from_static("sec-fetch-user"));
+    headers
+}
+
+/// GET headers for `get_user_info_qr` (jr.chat.zalo.me), mirroring zca-js.
+fn qr_userinfo_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, hv("*/*"));
+    headers.insert(REFERER, hv("https://chat.zalo.me/"));
+    headers.insert(HeaderName::from_static("priority"), hv("u=1, i"));
+    headers.insert(
+        HeaderName::from_static("sec-fetch-dest"),
+        hv("empty"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-mode"),
+        hv("cors"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-site"),
+        hv("same-site"),
+    );
+    base_browser_headers(&mut headers);
+    headers
+}
+
+async fn post_id_form(
+    ctx: &ContextBase,
+    url: &str,
+    params: &[(&str, &str)],
+    headers: HeaderMap,
+) -> Result<Value> {
     let form: Vec<(&str, String)> = params.iter().map(|(k, v)| (*k, v.to_string())).collect();
-    let res = http::post_form(ctx, url, &form).await?;
+    let body = form
+        .iter()
+        .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let res = http::request(ctx, Method::POST, url, Some(body), Some(headers), false).await?;
     let data: Value = res.json().await?;
     Ok(data)
 }
@@ -193,6 +347,7 @@ pub async fn get_login_info(ctx: &ContextBase, version: &str) -> Result<Value> {
         ctx,
         "https://id.zalo.me/account/logininfo",
         &[("continue", "https://zalo.me/pc"), ("v", version)],
+        qr_post_headers(LOGININFO_REFERER),
     )
     .await
 }
@@ -206,6 +361,7 @@ pub async fn verify_client(ctx: &ContextBase, version: &str) -> Result<Value> {
             ("continue", "https://zalo.me/pc"),
             ("v", version),
         ],
+        qr_post_headers(LOGININFO_REFERER),
     )
     .await
 }
@@ -215,6 +371,7 @@ pub async fn generate_qr(ctx: &ContextBase, version: &str) -> Result<QrGenerateR
         ctx,
         "https://id.zalo.me/account/authen/qr/generate",
         &[("continue", "https://zalo.me/pc"), ("v", version)],
+        qr_post_headers(LOGININFO_REFERER),
     )
     .await?;
     let resp: QrGenerateResponse = serde_json::from_value(data.clone()).unwrap_or_default();
@@ -241,6 +398,7 @@ pub async fn waiting_scan(ctx: &ContextBase, version: &str, code: &str) -> Resul
                 ("continue", "https://chat.zalo.me/"),
                 ("v", version),
             ],
+            qr_post_headers(WAITING_REFERER),
         )
         .await?;
         let resp: QrScanResponse = serde_json::from_value(data).unwrap_or_default();
@@ -268,6 +426,7 @@ pub async fn waiting_confirm(
                 ("continue", "https://chat.zalo.me/"),
                 ("v", version),
             ],
+            qr_post_headers(WAITING_REFERER),
         )
         .await?;
         let resp: QrConfirmResponse = serde_json::from_value(data).unwrap_or_default();
@@ -280,15 +439,27 @@ pub async fn waiting_confirm(
 }
 
 pub async fn check_session(ctx: &ContextBase) -> Result<reqwest::Response> {
-    http::get(
+    http::request(
         ctx,
+        Method::GET,
         "https://id.zalo.me/account/checksession?continue=https%3A%2F%2Fchat.zalo.me%2Findex.html",
+        None,
+        Some(qr_session_headers()),
+        false,
     )
     .await
 }
 
 pub async fn get_user_info_qr(ctx: &ContextBase) -> Result<QrUserInfoResponse> {
-    let res = http::get(ctx, "https://jr.chat.zalo.me/jr/userinfo").await?;
+    let res = http::request(
+        ctx,
+        Method::GET,
+        "https://jr.chat.zalo.me/jr/userinfo",
+        None,
+        Some(qr_userinfo_headers()),
+        false,
+    )
+    .await?;
     let data: Value = res.json().await?;
     Ok(serde_json::from_value(data).unwrap_or_default())
 }
@@ -462,7 +633,55 @@ pub async fn login_qr(
 
 #[cfg(test)]
 mod tests {
-    use super::extract_login_version;
+    use super::{
+        extract_login_version, qr_page_headers, qr_post_headers, qr_userinfo_headers,
+        LOGININFO_REFERER,
+    };
+
+    #[test]
+    fn post_headers_match_working_js_flow() {
+        let h = qr_post_headers(LOGININFO_REFERER);
+        assert_eq!(h.get("accept").unwrap(), "*/*");
+        assert_eq!(
+            h.get("accept-language").unwrap(),
+            "vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5"
+        );
+        assert_eq!(
+            h.get("sec-ch-ua").unwrap(),
+            "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\""
+        );
+        assert_eq!(h.get("sec-ch-ua-mobile").unwrap(), "?0");
+        assert_eq!(h.get("sec-ch-ua-platform").unwrap(), "\"Windows\"");
+        assert_eq!(h.get("sec-fetch-dest").unwrap(), "empty");
+        assert_eq!(h.get("sec-fetch-mode").unwrap(), "cors");
+        assert_eq!(h.get("sec-fetch-site").unwrap(), "same-origin");
+        assert_eq!(h.get("priority").unwrap(), "u=1, i");
+        assert_eq!(h.get("referer").unwrap(), LOGININFO_REFERER);
+        assert_eq!(
+            h.get("referrer-policy").unwrap(),
+            "strict-origin-when-cross-origin"
+        );
+    }
+
+    #[test]
+    fn page_headers_look_like_browser_navigation() {
+        let h = qr_page_headers();
+        assert_eq!(h.get("sec-fetch-dest").unwrap(), "document");
+        assert_eq!(h.get("sec-fetch-mode").unwrap(), "navigate");
+        assert_eq!(h.get("sec-fetch-site").unwrap(), "same-site");
+        assert_eq!(h.get("sec-fetch-user").unwrap(), "?1");
+        assert_eq!(h.get("upgrade-insecure-requests").unwrap(), "1");
+        assert_eq!(h.get("cache-control").unwrap(), "max-age=0");
+        assert_eq!(h.get("referer").unwrap(), "https://chat.zalo.me/");
+    }
+
+    #[test]
+    fn userinfo_headers_match_working_js_flow() {
+        let h = qr_userinfo_headers();
+        assert_eq!(h.get("accept").unwrap(), "*/*");
+        assert_eq!(h.get("sec-fetch-site").unwrap(), "same-site");
+        assert_eq!(h.get("referer").unwrap(), "https://chat.zalo.me/");
+    }
 
     #[test]
     fn ignores_css_bundle_and_picks_js_version() {
