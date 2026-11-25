@@ -5,9 +5,12 @@ use std::io::Read;
 use std::path::Path;
 
 use aes_gcm::aead::AeadInPlace;
-use aes_gcm::aes::Aes128;
+use aes_gcm::aes::{Aes128, Aes192, Aes256};
 use aes_gcm::{AesGcm, KeyInit};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use chrono::{Datelike, Timelike};
 use flate2::read::ZlibDecoder;
 use generic_array::typenum::U16;
@@ -38,6 +41,22 @@ pub fn remove_undefined_keys(obj: &mut Map<String, serde_json::Value>) {
 /// Decode a Base64 string into a byte buffer.
 pub fn decode_base64_to_buffer(data: &str) -> Vec<u8> {
     BASE64.decode(data).unwrap_or_default()
+}
+
+/// Base64 decode with the same leniency as Node's `Buffer.from(s, "base64")`
+/// (what zca-js `decodeBase64ToBuffer` uses): accepts the standard and the
+/// URL-safe alphabets, with or without `=` padding, and ignores whitespace.
+/// The strict `STANDARD` decoder rejects all of those, so a server payload
+/// in base64url / unpadded form failed to decode and every encrypted WS
+/// event fell back to its raw `{encrypt, data, ...}` frame (group messages
+/// were then dropped by the bot because they have no `groupMsgs`).
+fn decode_base64_lenient(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    let cleaned: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    BASE64
+        .decode(&cleaned)
+        .or_else(|_| URL_SAFE.decode(&cleaned))
+        .or_else(|_| STANDARD_NO_PAD.decode(&cleaned))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(&cleaned))
 }
 
 /// Decode a UTF-8 byte array into a string, or `None` on invalid UTF-8.
@@ -92,7 +111,7 @@ pub async fn decode_event_data(
             .into_owned()
     };
 
-    let decoded_buffer = BASE64.decode(raw_data).map_err(|e| {
+    let decoded_buffer = decode_base64_lenient(&raw_data).map_err(|e| {
         ZaloApiError::new(format!("Failed to base64-decode data: {}", e))
     })?;
 
@@ -104,26 +123,47 @@ pub async fn decode_event_data(
             return Err(ZaloApiError::new("Invalid data length or missing cipher key"));
         }
 
-        let key_bytes = BASE64.decode(key_b64).map_err(|e| {
+        let key_bytes = decode_base64_lenient(key_b64).map_err(|e| {
             ZaloApiError::new(format!("Failed to decode cipher key: {}", e))
         })?;
-        if key_bytes.len() != 16 {
-            return Err(ZaloApiError::new("Cipher key must be 16 bytes"));
-        }
-
-        // Layout matches TypeScript (src/core/utils.ts):
-        // iv (nonce): [0..16], additionalData (AAD): [16..32],
-        // ciphertext: [32..len-16], tag: [len-16..len]
+        // WebCrypto `importKey("raw", ...)` in zca-js accepts any valid
+        // AES-GCM key size (128/192/256 bit); the old code required exactly
+        // 16 bytes, so a 24/32-byte server cipher key made EVERY encrypted
+        // event fail to decode (and the WS layer silently fell back to the
+        // raw frame, which the bot then dropped).
         let nonce = GenericArray::<u8, U16>::from_slice(&decoded_buffer[0..16]);
         let aad = &decoded_buffer[16..32];
         let tag = GenericArray::<u8, U16>::from_slice(&decoded_buffer[decoded_buffer.len() - 16..]);
         let mut ciphertext = decoded_buffer[32..decoded_buffer.len() - 16].to_vec();
-
-        let cipher = AesGcm::<Aes128, U16>::new_from_slice(&key_bytes)
-            .map_err(|e| ZaloApiError::new(format!("Failed to create cipher: {}", e)))?;
-        cipher
-            .decrypt_in_place_detached(nonce, aad, &mut ciphertext, tag)
-            .map_err(|e| ZaloApiError::new(format!("AES-GCM decryption failed: {}", e)))?;
+        match key_bytes.len() {
+            16 => {
+                let cipher = AesGcm::<Aes128, U16>::new_from_slice(&key_bytes)
+                    .map_err(|e| ZaloApiError::new(format!("Failed to create cipher: {}", e)))?;
+                cipher
+                    .decrypt_in_place_detached(nonce, aad, &mut ciphertext, tag)
+                    .map_err(|e| ZaloApiError::new(format!("AES-GCM decryption failed: {}", e)))?;
+            }
+            24 => {
+                let cipher = AesGcm::<Aes192, U16>::new_from_slice(&key_bytes)
+                    .map_err(|e| ZaloApiError::new(format!("Failed to create cipher: {}", e)))?;
+                cipher
+                    .decrypt_in_place_detached(nonce, aad, &mut ciphertext, tag)
+                    .map_err(|e| ZaloApiError::new(format!("AES-GCM decryption failed: {}", e)))?;
+            }
+            32 => {
+                let cipher = AesGcm::<Aes256, U16>::new_from_slice(&key_bytes)
+                    .map_err(|e| ZaloApiError::new(format!("Failed to create cipher: {}", e)))?;
+                cipher
+                    .decrypt_in_place_detached(nonce, aad, &mut ciphertext, tag)
+                    .map_err(|e| ZaloApiError::new(format!("AES-GCM decryption failed: {}", e)))?;
+            }
+            n => {
+                return Err(ZaloApiError::new(format!(
+                    "Cipher key must be 16, 24 or 32 bytes, got {}",
+                    n
+                )))
+            }
+        }
 
         ciphertext
     } else {
@@ -433,5 +473,176 @@ pub fn normalize_holder_name(input: Option<&str>) -> Option<String> {
         Some(normalized)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod decode_event_data_tests {
+    use super::*;
+    use aes_gcm::aead::{Aead, Payload};
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    /// Wire-format `data` exactly like the Zalo server / zca-js
+    /// `decodeEventData` expects: zlib (unless encrypt==3) -> AES-GCM
+    /// (nonce[0..16] + aad[16..32] + ciphertext+tag) -> base64 ->
+    /// URL-encoded (unless encrypt==1). Key may be 16/24/32 bytes.
+    fn encrypt_ts_style(payload: &str, key_b64: &str, encrypt: i64) -> String {
+        let key_bytes = BASE64.decode(key_b64).unwrap();
+        let plain: Vec<u8> = if encrypt == 3 {
+            payload.as_bytes().to_vec()
+        } else {
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(payload.as_bytes()).unwrap();
+            enc.finish().unwrap()
+        };
+        let mut wire: Vec<u8> = Vec::new();
+        let nonce: [u8; 16] = [7u8; 16];
+        let aad: [u8; 16] = [9u8; 16];
+        wire.extend_from_slice(&nonce);
+        wire.extend_from_slice(&aad);
+        let ct = match key_bytes.len() {
+            16 => {
+                let c = AesGcm::<Aes128, U16>::new_from_slice(&key_bytes).unwrap();
+                c.encrypt(
+                    GenericArray::from_slice(&nonce),
+                    Payload { msg: &plain, aad: &aad },
+                )
+                .unwrap()
+            }
+            24 => {
+                let c = AesGcm::<Aes192, U16>::new_from_slice(&key_bytes).unwrap();
+                c.encrypt(
+                    GenericArray::from_slice(&nonce),
+                    Payload { msg: &plain, aad: &aad },
+                )
+                .unwrap()
+            }
+            32 => {
+                let c = AesGcm::<Aes256, U16>::new_from_slice(&key_bytes).unwrap();
+                c.encrypt(
+                    GenericArray::from_slice(&nonce),
+                    Payload { msg: &plain, aad: &aad },
+                )
+                .unwrap()
+            }
+            n => panic!("bad key len {n}"),
+        };
+        wire.extend_from_slice(&ct);
+        let b64 = BASE64.encode(&wire);
+        if encrypt == 1 {
+            b64
+        } else {
+            urlencoding::encode(&b64).into_owned()
+        }
+    }
+
+    fn frame(data: &str, encrypt: i64) -> Map<String, serde_json::Value> {
+        serde_json::json!({
+            "encrypt": encrypt,
+            "data": data,
+            "error_message": "",
+            "error_code": 0,
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    /// The exact shape a live 521 group frame has on the wire
+    /// (keys encrypt/data/error_message/error_code); after decode it must
+    /// yield the groupMsgs payload the bot parses.
+    const GROUP_PAYLOAD: &str =
+        r#"{"groupMsgs":[{"idTo":"123456","uidFrom":"418669971689260834","content":"/bot on","cliMsgId":"7","msgId":"9"}]}"#;
+
+    fn decoded_value(
+        out: Result<Option<DecodedEventData>, ZaloApiError>,
+    ) -> serde_json::Value {
+        match out {
+            Ok(Some(DecodedEventData::Value(v))) => v,
+            other => panic!("expected decoded Value, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypt2_16_byte_key_decodes_group_frame() {
+        let key_b64 = BASE64.encode([1u8; 16]);
+        let data = encrypt_ts_style(GROUP_PAYLOAD, &key_b64, 2);
+        let v = decoded_value(decode_event_data(&frame(&data, 2), Some(&key_b64)).await);
+        assert_eq!(v["groupMsgs"][0]["idTo"], "123456");
+        assert_eq!(v["groupMsgs"][0]["content"], "/bot on");
+    }
+
+    #[tokio::test]
+    async fn encrypt2_24_byte_key_decodes_group_frame() {
+        let key_b64 = BASE64.encode([2u8; 24]);
+        let data = encrypt_ts_style(GROUP_PAYLOAD, &key_b64, 2);
+        let v = decoded_value(decode_event_data(&frame(&data, 2), Some(&key_b64)).await);
+        assert_eq!(v["groupMsgs"][0]["content"], "/bot on");
+    }
+
+    #[tokio::test]
+    async fn encrypt2_32_byte_key_decodes_group_frame() {
+        let key_b64 = BASE64.encode([3u8; 32]);
+        let data = encrypt_ts_style(GROUP_PAYLOAD, &key_b64, 2);
+        let v = decoded_value(decode_event_data(&frame(&data, 2), Some(&key_b64)).await);
+        assert_eq!(v["groupMsgs"][0]["content"], "/bot on");
+    }
+
+    #[tokio::test]
+    async fn encrypt3_32_byte_key_no_decompress() {
+        let key_b64 = BASE64.encode([4u8; 32]);
+        let data = encrypt_ts_style(GROUP_PAYLOAD, &key_b64, 3);
+        let v = decoded_value(decode_event_data(&frame(&data, 3), Some(&key_b64)).await);
+        assert_eq!(v["groupMsgs"][0]["content"], "/bot on");
+    }
+
+    #[tokio::test]
+    async fn encrypt1_base64_zlib_no_key() {
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(GROUP_PAYLOAD.as_bytes()).unwrap();
+        let data = BASE64.encode(enc.finish().unwrap());
+        let v = decoded_value(decode_event_data(&frame(&data, 1), None).await);
+        assert_eq!(v["groupMsgs"][0]["content"], "/bot on");
+    }
+
+    #[tokio::test]
+    async fn encrypt0_plain_json() {
+        let v = decoded_value(decode_event_data(&frame(GROUP_PAYLOAD, 0), None).await);
+        assert_eq!(v["groupMsgs"][0]["content"], "/bot on");
+    }
+
+    #[tokio::test]
+    async fn encrypt2_base64url_unpadded_payload_decodes() {
+        // Node's Buffer.from(s, "base64") accepts base64url alphabet and
+        // missing padding; the strict decoder rejected both.
+        let key_b64 = BASE64.encode([5u8; 16]);
+        let data = encrypt_ts_style(GROUP_PAYLOAD, &key_b64, 2);
+        let url_decoded = urlencoding::decode(&data).unwrap().into_owned();
+        let b64url_unpadded = url_decoded
+            .replace('+', "-")
+            .replace('/', "_")
+            .trim_end_matches('=')
+            .to_string();
+        let wire = urlencoding::encode(&b64url_unpadded).into_owned();
+        let v = decoded_value(decode_event_data(&frame(&wire, 2), Some(&key_b64)).await);
+        assert_eq!(v["groupMsgs"][0]["content"], "/bot on");
+    }
+
+    #[tokio::test]
+    async fn encrypt2_missing_key_is_error() {
+        let key_b64 = BASE64.encode([1u8; 16]);
+        let data = encrypt_ts_style(GROUP_PAYLOAD, &key_b64, 2);
+        let out = decode_event_data(&frame(&data, 2), None).await;
+        assert!(out.is_err(), "missing cipher key must fail, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn invalid_key_length_is_error() {
+        let key_b64 = BASE64.encode([1u8; 20]);
+        let data = encrypt_ts_style(GROUP_PAYLOAD, &BASE64.encode([1u8; 16]), 2);
+        let out = decode_event_data(&frame(&data, 2), Some(&key_b64)).await;
+        assert!(out.is_err(), "20-byte key must fail, got {out:?}");
     }
 }

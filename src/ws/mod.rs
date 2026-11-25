@@ -378,6 +378,7 @@ async fn handle_binary_message(
         if let Some(key) = parsed_data.get("key").and_then(|v| v.as_str()) {
             let mut guard = cipher_key.lock().await;
             *guard = Some(key.to_string());
+            zlog_info!("WS cipher key received ({} chars)", key.len());
             let _ = event_tx.send(ListenerEvent::CipherKey(key.to_string()));
             // Send initial ping
             let _ = out_tx.send(encode_payload(
@@ -399,6 +400,11 @@ async fn handle_binary_message(
 
     // Decode encrypted event payloads. Mirrors the TypeScript client, which
     // calls decodeEventData on every event cmd before processing.
+    // NOTE: a failed decode used to fall back to the raw frame SILENTLY, so
+    // every encrypted group message arrived at the bot as
+    // {encrypt, data, error_message, error_code} with no groupMsgs and was
+    // dropped without a trace. Log the reason (no message content) so the
+    // next run shows exactly why a frame could not be decoded.
     let key_guard = cipher_key.lock().await;
     let event_data = if let Value::Object(map) = &parsed_data {
         let encrypt = map.get("encrypt").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -406,7 +412,29 @@ async fn handle_binary_message(
             match decode_event_data(map, key_guard.as_deref()).await {
                 Ok(Some(DecodedEventData::Object(m))) => Value::Object(m),
                 Ok(Some(DecodedEventData::Value(v))) => v,
-                Ok(None) | Err(_) => parsed_data.clone(),
+                Ok(None) => {
+                    zlog_warn!(
+                        "WS decode: cmd={} sub={} encrypt={} decoded empty (data_len={}, key_present={})",
+                        cmd,
+                        sub_cmd,
+                        encrypt,
+                        map.get("data").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0),
+                        key_guard.is_some()
+                    );
+                    parsed_data.clone()
+                }
+                Err(e) => {
+                    zlog_warn!(
+                        "WS decode failed: cmd={} sub={} encrypt={} data_len={} key_present={} err={}",
+                        cmd,
+                        sub_cmd,
+                        encrypt,
+                        map.get("data").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0),
+                        key_guard.is_some(),
+                        e
+                    );
+                    parsed_data.clone()
+                }
             }
         } else {
             parsed_data.clone()
