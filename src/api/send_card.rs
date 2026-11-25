@@ -3,7 +3,8 @@ use serde_json::Value;
 
 use crate::api::client::ApiClient;
 use crate::api::get_qr;
-use crate::errors::Result;
+use crate::api::send_message::next_client_id;
+use crate::errors::{Result, ZaloApiError, ZaloError};
 use crate::models::r#enum::ThreadType;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,7 +19,7 @@ pub struct SendCardOptions {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SendCardResponse {
     #[serde(rename = "msgId", default)]
-    pub msg_id: i64,
+    pub msg_id: Value,
 }
 
 /// Send a card to a User/Group.
@@ -30,7 +31,14 @@ pub async fn send_card(
 ) -> Result<SendCardResponse> {
     let qr = get_qr::get_qr(client, &[options.user_id.clone()]).await?;
     let qr_code_url = qr.get(&options.user_id).cloned().unwrap_or_default();
-    let client_id = chrono::Utc::now().timestamp_millis().to_string();
+    // A card without its QR code URL is useless: fail loudly instead of
+    // sending it with an empty qrCodeUrl.
+    if qr_code_url.is_empty() {
+        return Err(ZaloError::Api(ZaloApiError::new(
+            "Missing QR code URL for user",
+        )));
+    }
+    let client_id = next_client_id().to_string();
 
     let mut msg_info = serde_json::json!({
         "contactUid": options.user_id,
@@ -66,4 +74,20 @@ pub async fn send_card(
     }
 
     client.post_encrypted(&url, &params).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_card_response_accepts_string_msg_id() {
+        // Same as the other send_* responses: msgId may arrive as a string.
+        let resp: SendCardResponse =
+            serde_json::from_value(serde_json::json!({"msgId": "123"})).unwrap();
+        assert_eq!(resp.msg_id, Value::String("123".to_string()));
+        let resp: SendCardResponse =
+            serde_json::from_value(serde_json::json!({"msgId": 456})).unwrap();
+        assert_eq!(resp.msg_id, Value::from(456));
+    }
 }

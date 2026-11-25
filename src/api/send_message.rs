@@ -1,6 +1,8 @@
 //! Send message endpoint: text messages with optional mentions, quotes,
 //! attachments, text styles, urgency and TTL (mirrors the TypeScript source).
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -8,6 +10,30 @@ use crate::api::client::ApiClient;
 use crate::api::upload_attachment::{AttachmentSource, UploadAttachmentType};
 use crate::errors::{Result, ZaloApiError, ZaloError};
 use crate::models::r#enum::ThreadType;
+
+/// Last clientId handed out (wall-clock millis). Kept so that two sends in
+/// the same millisecond still get distinct ids instead of colliding on a
+/// bare `Date.now()` — Zalo dedups by clientId and would drop one of them.
+static LAST_CLIENT_ID: AtomicI64 = AtomicI64::new(0);
+
+/// Unique per-process `clientId`, shared by the other `send_*` endpoints.
+///
+/// The value stays timestamp-like: it is the current wall-clock millis,
+/// bumped just past the previously issued id only when the clock has not
+/// advanced yet (bursts within one millisecond). Strictly increasing within
+/// the process, so concurrent sends can never share a clientId.
+pub(crate) fn next_client_id() -> i64 {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut last = LAST_CLIENT_ID.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last.saturating_add(1));
+        match LAST_CLIENT_ID.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => return next,
+            Err(actual) => last = actual,
+        }
+    }
+}
 
 /// Message urgency, mirrored into `metaData.urgency` (matches the TS `Urgency` enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,12 +91,18 @@ fn insert_opt(map: &mut Map<String, Value>, key: &str, value: Option<Value>) {
     }
 }
 
-/// Extract msg_id from API response (handles both msgId and msg_id).
+/// Extract msg_id from API response (handles both msgId and msg_id, and
+/// both numeric and string forms: Zalo returns msgId as a string —
+/// `TMessage.msg_id` is a `String` — so a numeric-only parse would report
+/// "Missing msg_id" even though the message was sent).
 fn extract_msg_id(response: Value) -> Result<i64> {
     response
         .get("msgId")
         .or_else(|| response.get("msg_id"))
-        .and_then(|v| v.as_i64())
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
         .ok_or_else(|| ZaloError::Api(ZaloApiError::new("Missing msg_id in response")))
 }
 
@@ -102,10 +134,7 @@ pub async fn send_message(
     let url = client.service_url(service, path)?;
     let url = client.make_url(&url, &[], true)?;
 
-    let client_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
+    let client_id = next_client_id();
 
     let params = if is_group {
         serde_json::json!({
@@ -137,6 +166,12 @@ pub async fn send_message(
 /// - quote fields  → `/api/{message,group}/quote`
 /// - mention (group only) → `/api/group/mention`
 /// - otherwise     → `/api/message/sms` (user) or `/api/group/sendmsg` (group)
+///
+/// Quote + mention together: the quote endpoint is chosen, but `mentionInfo`
+/// is still sent along for group threads (the quote endpoint receives it);
+/// when the text is sent first ahead of attachments it carries the mention
+/// too. Mentions in 1-1 chats are rejected outright instead of being dropped
+/// silently — the Zalo mention endpoints are group-only.
 ///
 /// When only a plain text message is given the behaviour matches
 /// [`send_message`].
@@ -189,6 +224,14 @@ pub async fn send_message_options(
         || quote_ttl.is_some();
     let mention_present = mention_info.is_some();
 
+    // Mentions are group-only: fail loudly instead of silently dropping
+    // mentionInfo for a 1-1 thread.
+    if mention_present && !is_group {
+        return Err(ZaloError::Api(ZaloApiError::new(
+            "Mentions are only supported in group threads",
+        )));
+    }
+
     let path = if quote_present {
         format!("{}/quote", root)
     } else if mention_present && is_group {
@@ -202,7 +245,7 @@ pub async fn send_message_options(
     let url = client.service_url(service, &path)?;
     let url = client.make_url(&url, &[("nretry", "0".to_string())], true)?;
 
-    let client_id = chrono::Utc::now().timestamp_millis();
+    let client_id = next_client_id();
 
     let message_empty = message.is_empty();
     let mut params = Map::new();
@@ -314,6 +357,11 @@ fn can_carry_text_as_desc(sources: &[AttachmentSource]) -> bool {
 ///
 /// Returns the `msg_id` of the last attachment sent (the TypeScript client
 /// returns one result per attachment; this API returns a single `msg_id`).
+/// Fails instead of returning `0` when nothing was sent at all.
+///
+/// Mentions ride on the separately-sent text message when a quote is
+/// present; on the attachment itself they only ride on a single image that
+/// carries the text as its description, without a quote (TypeScript).
 async fn send_uploaded_attachments(
     client: &ApiClient,
     uploaded: &[UploadAttachmentType],
@@ -325,16 +373,23 @@ async fn send_uploaded_attachments(
     ttl: Option<i64>,
     meta_data: Option<&Value>,
 ) -> Result<i64> {
+    if uploaded.is_empty() {
+        return Err(ZaloError::Api(ZaloApiError::new(
+            "No attachments to send",
+        )));
+    }
     let is_group = thread_type == ThreadType::Group;
     let is_multi = uploaded.len() > 1;
     // TypeScript `getGroupLayoutId()` returns `Date.now()`.
     let group_layout_id = chrono::Utc::now().timestamp_millis();
-    let mut client_id = chrono::Utc::now().timestamp_millis();
     // TypeScript counts down from `uploadAttachment.length - 1`.
     let mut index_in_group = uploaded.len() as i64 - 1;
-    let mut last_msg_id = 0i64;
+    let mut last_msg_id: Option<i64> = None;
 
     for att in uploaded {
+        // Fresh unique id per attachment (never a bare timestamp: two
+        // attachments sent in the same millisecond must not share one).
+        let client_id = next_client_id();
         let (path, mut params) = match att {
             UploadAttachmentType::Image(img) => {
                 let mut p = serde_json::json!({
@@ -351,6 +406,16 @@ async fn send_uploaded_attachments(
                     "ttl": ttl.unwrap_or(0),
                     "jcp": "{\"convertible\":\"jxl\"}",
                 });
+                // The upload could not measure this image: omit the
+                // dimensions instead of sending a bogus 0x0 and letting
+                // Zalo use the uploaded file's real size.
+                if img.width == 0 || img.height == 0 {
+                    p.as_object_mut()
+                        .map(|o| {
+                            o.remove("width");
+                            o.remove("height");
+                        });
+                }
                 if is_group {
                     p["grid"] = Value::String(thread_id.to_string());
                     p["oriUrl"] = Value::String(img.normal_url.clone());
@@ -438,16 +503,17 @@ async fn send_uploaded_attachments(
         if let Some(m) = meta_data {
             params["metaData"] = m.clone();
         }
-        client_id += 1;
         index_in_group -= 1;
 
         let base_url = client.service_url("file", path)?;
         let url = client.make_url(&base_url, &[("nretry", "0".to_string())], true)?;
         let response: Value = client.post_encrypted(&url, &params).await?;
-        last_msg_id = extract_msg_id(response)?;
+        last_msg_id = Some(extract_msg_id(response)?);
     }
 
-    Ok(last_msg_id)
+    last_msg_id.ok_or_else(|| {
+        ZaloError::Api(ZaloApiError::new("No attachment was sent successfully"))
+    })
 }
 
 #[cfg(test)]
@@ -472,6 +538,35 @@ mod tests {
             attachment_extension(&AttachmentSource::Path("/tmp/noext".into())),
             ""
         );
+    }
+
+    #[test]
+    fn extract_msg_id_accepts_string_and_numeric_forms() {
+        // Zalo returns msgId as a string (TMessage.msg_id is a String).
+        assert_eq!(
+            extract_msg_id(serde_json::json!({"msgId": "9"})).unwrap(),
+            9
+        );
+        assert_eq!(
+            extract_msg_id(serde_json::json!({"msgId": 42})).unwrap(),
+            42
+        );
+        assert_eq!(
+            extract_msg_id(serde_json::json!({"msg_id": "7"})).unwrap(),
+            7
+        );
+        assert!(extract_msg_id(serde_json::json!({})).is_err());
+        assert!(extract_msg_id(serde_json::json!({"msgId": "not-a-number"})).is_err());
+    }
+
+    #[test]
+    fn next_client_id_is_unique_and_strictly_increasing() {
+        let ids: Vec<i64> = (0..1000).map(|_| next_client_id()).collect();
+        for w in ids.windows(2) {
+            assert!(w[1] > w[0], "clientIds must be strictly increasing");
+        }
+        let unique: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len());
     }
 
     #[test]

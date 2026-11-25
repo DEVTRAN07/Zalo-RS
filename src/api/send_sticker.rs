@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::client::ApiClient;
+use crate::api::send_message::next_client_id;
 use crate::errors::{Result, ZaloApiError, ZaloError};
 use crate::models::r#enum::ThreadType;
 
@@ -50,7 +51,7 @@ pub async fn send_sticker(
         "stickerId": sticker.id,
         "cateId": sticker.cate_id,
         "type": sticker.sticker_type,
-        "clientId": chrono::Utc::now().timestamp_millis(),
+        "clientId": next_client_id(),
         "imei": client.ctx().imei,
         "zsource": 101,
     });

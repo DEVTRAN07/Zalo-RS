@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::client::ApiClient;
+use crate::api::send_message::next_client_id;
 use crate::errors::{Result, ZaloApiError, ZaloError};
 use crate::models::r#enum::ThreadType;
 
@@ -39,7 +40,7 @@ pub async fn send_voice(
         Err(_) => 0,
     };
 
-    let client_id = chrono::Utc::now().timestamp_millis().to_string();
+    let client_id = next_client_id().to_string();
     let msg_info = serde_json::json!({
         "voiceUrl": options.voice_url,
         "m4aUrl": options.voice_url,

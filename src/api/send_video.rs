@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::client::ApiClient;
+use crate::api::send_message::next_client_id;
 use crate::errors::{Result, ZaloApiError, ZaloError};
 use crate::models::r#enum::ThreadType;
 
@@ -49,7 +50,7 @@ pub async fn send_video(
         Err(_) => 0,
     };
 
-    let client_id = chrono::Utc::now().timestamp_millis();
+    let client_id = next_client_id();
     let msg_info = serde_json::json!({
         "videoUrl": options.video_url,
         "thumbUrl": options.thumbnail_url,
