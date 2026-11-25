@@ -47,12 +47,42 @@ pub async fn login(ctx: &ContextBase, encrypt_params: bool) -> Result<Option<Val
     }
     let data: Value = response.json().await?;
 
+    // Surface the server's real error instead of failing later with a
+    // generic "empty login response": a non-zero error_code means login
+    // itself failed (expired cookie, wrong imei, ...), and that code/message
+    // is what tells those cases apart.
+    let error_code = crate::factory::parse_error_code(data.get("error_code"));
+    if error_code != 0 {
+        let msg = data
+            .get("error_message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown login error");
+        return Err(ZaloError::Api(ZaloApiError::with_code(
+            format!("Login failed (error_code={}): {}", error_code, msg),
+            error_code,
+        )));
+    }
+
     if let Some(enk) = enc.enk {
         if let Some(encrypted_data) = data.get("data").and_then(|v| v.as_str()) {
             let decrypted = decrypt_resp(&enk, encrypted_data);
-            return Ok(decrypted);
+            return decrypted.map(Some).ok_or_else(|| {
+                ZaloError::Api(ZaloApiError::new(
+                    "Login failed: could not decrypt login response",
+                ))
+            });
         }
-        return Ok(None);
+        // error_code was 0 but there is no encrypted payload to decrypt.
+        // Some endpoints return `data` as a plain object instead; keep it.
+        // Anything else is a real failure, not an empty response: report it
+        // instead of Ok(None), which the caller would misread as a generic
+        // "empty login response".
+        return match data.get("data") {
+            Some(v) if !v.is_null() => Ok(Some(v.clone())),
+            _ => Err(ZaloError::Api(ZaloApiError::new(
+                "Login failed: empty login response (no data field)",
+            ))),
+        };
     }
 
     // Unencrypted path - return data as-is

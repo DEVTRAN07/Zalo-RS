@@ -20,7 +20,6 @@ use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::{Duration, timeout};
-use url::Url;
 
 use crate::context::{ContextBase, ZaloCookie};
 use crate::errors::{Result, ZaloApiError, ZaloError};
@@ -482,25 +481,33 @@ async fn extract_cookies(ctx: &ContextBase) -> Result<Vec<ZaloCookie>> {
         .lock()
         .map_err(|_| ZaloError::Api(ZaloApiError::new("Cookie store lock poisoned")))?;
 
+    // Iterate the stored cookies directly instead of `get_request_values`
+    // (which only yields name/value pairs), so domain/path/expiry survive
+    // into account.json/cookie.json. `iter_unexpired` already drops cookies
+    // past their expiry, so an expired cookie is never persisted and then
+    // sent again on the next login.
     let mut cookies = Vec::new();
-    for url_str in ["https://id.zalo.me/", "https://chat.zalo.me/"] {
-        let url = Url::parse(url_str)?;
-        for (name, value) in store.get_request_values(&url) {
-            cookies.push(ZaloCookie {
-                name: name.to_string(),
-                value: value.to_string(),
-                domain: None,
-                path: None,
-                expiration_date: None,
-                host_only: None,
-                http_only: None,
-                secure: None,
-                same_site: None,
-                session: None,
-                store_id: None,
-                key: None,
-            });
-        }
+    for c in store.iter_unexpired() {
+        let domain = c.domain.as_cow().map(|d| d.into_owned());
+        let host_only = matches!(c.domain, cookie_store::CookieDomain::HostOnly(_));
+        let expiration_date = match c.expires {
+            cookie_store::CookieExpiration::AtUtc(dt) => Some(dt.unix_timestamp() as f64),
+            cookie_store::CookieExpiration::SessionEnd => None,
+        };
+        cookies.push(ZaloCookie {
+            name: c.name().to_string(),
+            value: c.value().to_string(),
+            domain,
+            path: Some(c.path.as_ref().to_string()),
+            expiration_date,
+            host_only: Some(host_only),
+            http_only: c.http_only(),
+            secure: c.secure(),
+            same_site: c.same_site().map(|s| format!("{s:?}").to_lowercase()),
+            session: Some(!c.is_persistent()),
+            store_id: None,
+            key: None,
+        });
     }
     Ok(cookies)
 }
@@ -610,8 +617,12 @@ pub async fn login_qr(
         }
     }
 
-    // 7. Check session.
-    let _ = check_session(ctx).await?;
+    // 7. Check session (non-fatal: a transient network blip here must not
+    // fail the whole QR flow once the user has already confirmed, mirroring
+    // get_login_info/verify_client above).
+    if let Err(e) = check_session(ctx).await {
+        zlog_warn!("check_session failed (non-fatal): {}", e);
+    }
     zlog_info!("Successfully logged into the account");
 
     // 8. Get user info.
