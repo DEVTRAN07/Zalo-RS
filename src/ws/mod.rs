@@ -274,7 +274,16 @@ async fn connect_and_run(
 
     loop {
         tokio::select! {
-            _ = stop_rx.recv() => {
+            Some(()) = stop_rx.recv() => {
+                // Chỉ dừng khi nhận tín hiệu stop thật (Listener::stop()).
+                // Kênh đóng (None — Listener bị drop) KHÔNG được coi là
+                // stop: trước đây `_ = stop_rx.recv()` bắt cả None nên
+                // drop Listener (vd: ZaloApi::listen() tạo Listener cục
+                // bộ, trả rx rồi drop ngay) giết kết nối ngay sau khi
+                // nối, phát Disconnected 1000 "stopped" dù không ai gọi
+                // stop(). Với pattern Some(()), kênh đóng chỉ vô hiệu
+                // nhánh này; vòng lặp tiếp tục qua ping/read, socket
+                // đóng thật thì trả Ok(false) để retry_on_close nối lại.
                 let _ = out_tx.send(encode_payload(1, 3, 1, &serde_json::json!({"reason": "manual"})));
                 writer.abort();
                 return Ok(true);
