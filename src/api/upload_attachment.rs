@@ -200,8 +200,10 @@ fn is_extension_valid(ext: &str, settings: &Option<Value>) -> bool {
 
 fn classify_extension(ext: &str) -> FileKind {
     match ext.to_ascii_lowercase().as_str() {
-        "jpg" | "jpeg" | "png" | "webp" => FileKind::Image,
-        "mp4" => FileKind::Video,
+        // GIF is an image (animated): sending it as a plain file would not
+        // play inline. mov/webm are video containers, not generic files.
+        "jpg" | "jpeg" | "png" | "webp" | "gif" => FileKind::Image,
+        "mp4" | "mov" | "webm" => FileKind::Video,
         _ => FileKind::Other,
     }
 }
@@ -283,42 +285,40 @@ fn image_dimensions(data: &[u8]) -> Option<(u64, u64)> {
     None
 }
 
-async fn file_bytes_and_name(source: &AttachmentSource) -> Result<(Vec<u8>, String)> {
+async fn file_bytes_and_name(source: AttachmentSource) -> Result<(Vec<u8>, String)> {
     match source {
         AttachmentSource::Path(path) => {
-            let data = fs::read(path).await.map_err(|e| {
+            let data = fs::read(&path).await.map_err(|e| {
                 ZaloError::Api(ZaloApiError::new(format!(
                     "Failed to read file {}: {}",
                     path, e
                 )))
             })?;
-            let filename = Path::new(path)
+            let filename = Path::new(&path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("file")
                 .to_string();
             Ok((data, filename))
         }
-        AttachmentSource::Inline { filename, data, .. } => Ok((data.clone(), filename.clone())),
+        // Move the buffer out instead of cloning it: the caller owns `source`
+        // and no longer needs it after this point.
+        AttachmentSource::Inline { filename, data, .. } => Ok((data, filename)),
     }
 }
 
-async fn compute_checksum(source: &AttachmentSource, _total_size: u64) -> Result<String> {
+/// MD5 over the buffer already read for upload. The old code re-read the
+/// whole file from disk here (`fs::read`), so a 100 MB file cost >200 MB
+/// RAM (read #1 for chunking + read #2 for the checksum, plus a clone per
+/// chunk). Checksumming the shared buffer removes the second full copy.
+/// (Note: `core::utils::get_md5_large_file_object` streams from disk but
+/// takes the *other* `AttachmentSource` type (`models::attachment`, with an
+/// `InMemory` variant), so it cannot be reused for this enum directly.)
+fn checksum_bytes(bytes: &[u8]) -> String {
     use md5::{Digest, Md5};
     let mut hasher = Md5::new();
-    match source {
-        AttachmentSource::Path(path) => {
-            let bytes = fs::read(path).await.map_err(|e| {
-                ZaloError::Api(ZaloApiError::new(format!(
-                    "Failed to read file {}: {}",
-                    path, e
-                )))
-            })?;
-            hasher.update(&bytes);
-        }
-        AttachmentSource::Inline { data, .. } => hasher.update(data),
-    }
-    Ok(hex::encode(hasher.finalize()))
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 async fn post_chunk(
@@ -461,11 +461,12 @@ async fn upload_attachment_internal(
             }
         }
 
-        let (bytes, file_name) = file_bytes_and_name(&source).await?;
-        let ext = get_file_extension(if let AttachmentSource::Path(p) = &source {
-            p
-        } else {
-            &file_name
+        // Extension is derived before the source is moved into
+        // `file_bytes_and_name` (which takes ownership so an inline buffer
+        // is moved, not cloned).
+        let ext = get_file_extension(match &source {
+            AttachmentSource::Path(p) => p.as_str(),
+            AttachmentSource::Inline { filename, .. } => filename.as_str(),
         })
         .trim_start_matches('.')
         .to_ascii_lowercase();
@@ -476,7 +477,18 @@ async fn upload_attachment_internal(
             ))));
         }
 
+        let (bytes, file_name) = file_bytes_and_name(source).await?;
+
         let total_size = bytes.len() as u64;
+        // Empty file: `bytes.chunks()` would iterate zero times, leaving
+        // `last_raw` as None and failing later with the cryptic
+        // "Empty upload response". Fail here with a clear message instead.
+        if total_size == 0 {
+            return Err(ZaloError::Api(ZaloApiError::new(format!(
+                "File rỗng (empty file, 0 bytes): {}",
+                file_name
+            ))));
+        }
         if max_size_bytes > 0 && total_size > max_size_bytes {
             return Err(ZaloError::Api(ZaloApiError::new(format!(
                 "File {} size exceed maximum size of {}MB",
@@ -598,9 +610,8 @@ async fn upload_attachment_internal(
                     }
                 }
 
-                let checksum = compute_checksum(&source, total_size)
-                    .await
-                    .unwrap_or_default();
+                // Checksum over the buffer already in RAM — no second read.
+                let checksum = checksum_bytes(&bytes);
                 let file_url = ws_data
                     .as_ref()
                     .and_then(|d| d.get("fileUrl").or_else(|| d.get("file_url")))
@@ -647,4 +658,34 @@ async fn upload_attachment_internal(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_gif_is_image_and_mov_webm_are_video() {
+        assert!(matches!(classify_extension("gif"), FileKind::Image));
+        assert!(matches!(classify_extension("GIF"), FileKind::Image));
+        assert!(matches!(classify_extension("mov"), FileKind::Video));
+        assert!(matches!(classify_extension("webm"), FileKind::Video));
+        assert!(matches!(classify_extension("mp4"), FileKind::Video));
+        assert!(matches!(classify_extension("jpg"), FileKind::Image));
+        assert!(matches!(classify_extension("pdf"), FileKind::Other));
+        assert!(matches!(classify_extension("aac"), FileKind::Other));
+    }
+
+    #[test]
+    fn checksum_bytes_matches_known_md5() {
+        // md5("abc") = 900150983cd24fb0d6963f7d28e17f72
+        assert_eq!(
+            checksum_bytes(b"abc"),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+        assert_eq!(
+            checksum_bytes(b""),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+    }
 }
