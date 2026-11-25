@@ -6,6 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -104,6 +105,8 @@ impl Listener {
         let ctx = self.ctx.clone();
         let urls = self.urls.clone();
         let retry_on_close = self.retry_on_close;
+        let mut consecutive_failures: u32 = 0;
+        let last_connected_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
         tokio::spawn(async move {
             let mut url_idx = 0usize;
@@ -150,6 +153,9 @@ impl Listener {
                 zlog_verbose!("WS URL query params: t, imei, uid, zpw_enk | base={}", base);
                 let cipher_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
+                // Clear the previous session's connect timestamp so a failed
+                // connect can never look like a long-lived session.
+                *last_connected_at.lock().await = None;
                 let connect_result = connect_and_run(
                     &ctx,
                     &ws_url,
@@ -157,6 +163,7 @@ impl Listener {
                     &mut stop_rx,
                     cipher_key,
                     ctx.options.self_listen,
+                    last_connected_at.clone(),
                 )
                 .await;
 
@@ -176,19 +183,63 @@ impl Listener {
                             });
                             break;
                         }
-                        // Connection closed; try next endpoint after a short delay
+                        // Connection closed; try next endpoint after a backoff delay.
+                        // A session that lived long enough counts as healthy and
+                        // resets the failure streak; a quick close counts as a
+                        // failure and grows the delay (1s, 2s, 4s, ... capped 30s).
                         url_idx = (url_idx + 1) % urls.len();
-                        zlog_warn!("WebSocket closed, reconnecting...");
-                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                        let lived_long = last_connected_at
+                            .lock()
+                            .await
+                            .map(|t| t.elapsed() > std::time::Duration::from_secs(60))
+                            .unwrap_or(false);
+                        if lived_long {
+                            consecutive_failures = 0;
+                        } else {
+                            consecutive_failures += 1;
+                        }
+                        let delay_ms = backoff_delay_ms(consecutive_failures);
+                        zlog_warn!(
+                            "WebSocket closed, reconnecting in {}ms (consecutive failures: {})...",
+                            delay_ms,
+                            consecutive_failures
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
                     Err(e) => {
                         let _ = event_tx.send(ListenerEvent::Error(e.to_string()));
                         if !retry_on_close {
                             break;
                         }
+                        consecutive_failures += 1;
+                        if is_auth_error(&e) {
+                            // Permanent failure (expired/invalid cookie): retrying
+                            // forever cannot fix it, so stop and say so.
+                            let _ = event_tx.send(ListenerEvent::Disconnected {
+                                code: CloseReason::AbnormalClosure as u16,
+                                reason: "authentication failed (cookie expired?)".into(),
+                            });
+                            break;
+                        }
+                        if consecutive_failures >= 5 {
+                            let _ = event_tx.send(ListenerEvent::Disconnected {
+                                code: CloseReason::AbnormalClosure as u16,
+                                reason: format!(
+                                    "giving up after {} consecutive failures: {}",
+                                    consecutive_failures, e
+                                ),
+                            });
+                            break;
+                        }
                         url_idx = (url_idx + 1) % urls.len();
-                        zlog_warn!("WebSocket error: {}, reconnecting...", e);
-                        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                        let delay_ms = backoff_delay_ms(consecutive_failures);
+                        zlog_warn!(
+                            "WebSocket error: {}, reconnecting in {}ms (consecutive failures: {})...",
+                            e,
+                            delay_ms,
+                            consecutive_failures
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
                 }
             }
@@ -205,6 +256,22 @@ impl Listener {
     }
 }
 
+/// Exponential backoff for reconnects: 1s, 2s, 4s, 8s, 16s, capped at 30s.
+/// `failures == 0` (a healthy session just closed) waits the base 1s.
+fn backoff_delay_ms(failures: u32) -> u64 {
+    if failures == 0 {
+        return 1_000;
+    }
+    (1_000u64 << failures.saturating_sub(1).min(5)).min(30_000)
+}
+
+/// True when the error looks like an authentication failure (expired/invalid
+/// cookie). Such errors are permanent: retrying forever cannot fix them.
+fn is_auth_error(e: &ZaloError) -> bool {
+    let s = e.to_string().to_lowercase();
+    s.contains("401") || s.contains("403") || s.contains("unauthorized") || s.contains("forbidden")
+}
+
 async fn connect_and_run(
     ctx: &ContextSession,
     ws_url: &str,
@@ -212,6 +279,7 @@ async fn connect_and_run(
     stop_rx: &mut mpsc::Receiver<()>,
     cipher_key: Arc<Mutex<Option<String>>>,
     self_listen: bool,
+    last_connected_at: Arc<Mutex<Option<Instant>>>,
 ) -> Result<bool> {
     // Build request with headers matching the TypeScript client exactly.
     let mut request = ws_url
@@ -254,11 +322,20 @@ async fn connect_and_run(
         })?;
 
     let _ = event_tx.send(ListenerEvent::Connected);
+    *last_connected_at.lock().await = Some(Instant::now());
     zlog_info!("WebSocket connected");
 
     let (mut write, mut read) = ws_stream.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let ping_interval_ms = get_ping_interval_ms(ctx);
+    // Pong watchdog: if the server goes silent (no frames at all, not even a
+    // pong) for twice the ping interval (min 120s), the socket is dead even
+    // though no close frame arrived — drop it so the listener reconnects.
+    // The 120s floor avoids killing a healthy connection while the server
+    // is merely idle.
+    let mut last_rx_at = Instant::now();
+    let watchdog_limit =
+        std::time::Duration::from_millis(ping_interval_ms.saturating_mul(2).max(120_000));
     let mut ping_interval =
         tokio::time::interval(std::time::Duration::from_millis(ping_interval_ms));
     ping_interval.tick().await; // first tick is immediate
@@ -289,6 +366,15 @@ async fn connect_and_run(
                 return Ok(true);
             }
             _ = ping_interval.tick() => {
+                if last_rx_at.elapsed() > watchdog_limit {
+                    zlog_warn!(
+                        "WS watchdog: no frames received for {:?} (limit {:?}), reconnecting...",
+                        last_rx_at.elapsed(),
+                        watchdog_limit
+                    );
+                    writer.abort();
+                    return Ok(false);
+                }
                 let payload = encode_payload(1, 2, 1, &serde_json::json!({"eventId": now_ms()}));
                 if out_tx.send(payload).is_err() {
                     writer.abort();
@@ -300,16 +386,28 @@ async fn connect_and_run(
                     writer.abort();
                     return Ok(false);
                 };
+                // Any frame at all proves the socket is alive.
+                if msg.is_ok() {
+                    last_rx_at = Instant::now();
+                }
                 match msg {
                     Ok(WsMessage::Binary(data)) => {
-                        handle_binary_message(&ctx, &data, &cipher_key, &event_tx, &out_tx, self_listen).await;
+                        if handle_binary_message(&ctx, &data, &cipher_key, &event_tx, &out_tx, self_listen).await {
+                            writer.abort();
+                            return Ok(false);
+                        }
                     }
                     Ok(WsMessage::Close(frame)) => {
                         zlog_verbose!("WS close frame: {:?}", frame);
                         writer.abort();
                         return Ok(false);
                     }
-                    Ok(_) => {}
+                    Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {
+                        zlog_verbose!("WS ping/pong frame");
+                    }
+                    Ok(other) => {
+                        zlog_verbose!("WS frame: {:?}", std::mem::discriminant(&other));
+                    }
                     Err(e) => {
                         zlog_error!("WS read error: {}", e);
                         writer.abort();
@@ -340,6 +438,46 @@ fn is_self_event(data: &Value) -> bool {
     false
 }
 
+/// True when a uid value (string or number) matches our own uid.
+fn uid_matches(v: &Value, self_uid: &str) -> bool {
+    match v {
+        Value::String(s) => s == self_uid,
+        Value::Number(n) => n.to_string() == self_uid,
+        _ => false,
+    }
+}
+
+/// Check whether an event was sent by the current account, including group
+/// events whose `groupMsgs` items carry the sender per message.
+///
+/// Returns true when the top-level `isSelf` says so, or when EVERY item in
+/// `groupMsgs` (at `data.groupMsgs` or `data.data.groupMsgs`) is from us
+/// (`isSelf == true` or `uidFrom == self_uid`). A mixed batch — some items
+/// from us, some from others — must still be dispatched, so it returns false.
+fn is_self_group_event(data: &Value, self_uid: &str) -> bool {
+    if is_self_event(data) {
+        return true;
+    }
+    let msgs = data
+        .get("groupMsgs")
+        .or_else(|| data.get("data").and_then(|d| d.get("groupMsgs")));
+    let Some(msgs) = msgs.and_then(|m| m.as_array()) else {
+        return false;
+    };
+    if msgs.is_empty() {
+        return false;
+    }
+    msgs.iter().all(|item| {
+        item.get("isSelf").and_then(|v| v.as_bool()).unwrap_or(false)
+            || item
+                .get("uidFrom")
+                .map(|v| uid_matches(v, self_uid))
+                .unwrap_or(false)
+    })
+}
+
+/// Handle one binary frame. Returns `true` when the caller must close the
+/// socket (e.g. the server reports a duplicate connection).
 async fn handle_binary_message(
     ctx: &ContextSession,
     data: &[u8],
@@ -347,9 +485,10 @@ async fn handle_binary_message(
     event_tx: &mpsc::UnboundedSender<ListenerEvent>,
     out_tx: &mpsc::UnboundedSender<Vec<u8>>,
     self_listen: bool,
-) {
+) -> bool {
     if data.len() < 4 {
-        return;
+        zlog_warn!("WS frame too short: {} bytes, expected at least 4", data.len());
+        return false;
     }
     let version = data[0];
     let cmd = u16::from_le_bytes([data[1], data[2]]);
@@ -362,7 +501,7 @@ async fn handle_binary_message(
         match serde_json::from_slice(payload_bytes) {
             Ok(v) => v,
             Err(e) => {
-                zlog_verbose!(
+                zlog_warn!(
                     "Failed to parse WS payload JSON (cmd={}, sub={}): {}",
                     cmd,
                     sub_cmd,
@@ -387,15 +526,17 @@ async fn handle_binary_message(
                 1,
                 &serde_json::json!({"eventId": now_ms()}),
             ));
-            return;
+            return false;
         }
     }
 
-    // Duplicate connection
+    // Duplicate connection: another client logged in with the same account.
+    // The server will not deliver events to this socket any more, so ask the
+    // caller to close it and reconnect instead of idling forever.
     if version == 1 && cmd == 3000 && sub_cmd == 0 {
         zlog_error!("Another connection is opened (duplicate connection)");
         let _ = event_tx.send(ListenerEvent::Error("Duplicate connection".into()));
-        return;
+        return true;
     }
 
     // Decode encrypted event payloads. Mirrors the TypeScript client, which
@@ -453,70 +594,33 @@ async fn handle_binary_message(
 
     match (cmd, sub_cmd) {
         (501, 0) | (551, 0) => {
-            if !self_listen && is_self_event(&event_data) {
-                return;
+            if !self_listen && is_self_group_event(&event_data, &ctx.uid) {
+                return false;
             }
             let _ = event_tx.send(ListenerEvent::Message(event_data));
         }
         (521, 0) => {
-            if !self_listen && is_self_event(&event_data) {
-                return;
+            if !self_listen && is_self_group_event(&event_data, &ctx.uid) {
+                return false;
             }
             let _ = event_tx.send(ListenerEvent::GroupMessage(event_data));
         }
         (612, _) | (610, _) | (611, _) => {
-            if !self_listen && is_self_event(&event_data) {
-                return;
+            if !self_listen && is_self_group_event(&event_data, &ctx.uid) {
+                return false;
             }
             let _ = event_tx.send(ListenerEvent::Reaction(event_data));
         }
         (601, 0) => {
+            // Dispatch the upload completion callback FIRST: a self-sent
+            // file/voice upload must resolve its waiter even when
+            // self_listen is off, otherwise the upload stalls until its
+            // 120s timeout. Only afterwards filter self events.
+            dispatch_file_done_callback(ctx, &event_data).await;
             if !self_listen && is_self_event(&event_data) {
-                return;
+                return false;
             }
             let _ = event_tx.send(ListenerEvent::Control(event_data.clone()));
-
-            // Async upload completion callback (TS: listen.ts uploadCallbacks for file_done/send_file_done).
-            if let Some(obj) = event_data.as_object() {
-                if let Some(content) = obj.get("content").and_then(|v| v.as_object()) {
-                    let act = content.get("act").and_then(|v| v.as_str()).unwrap_or("");
-                    let act_type = content
-                        .get("act_type")
-                        .or_else(|| content.get("actType"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if act_type == "file_done" && (act == "send_file_done" || act == "file_done") {
-                        if let Some(file_id) = content
-                            .get("fileId")
-                            .or_else(|| content.get("file_id"))
-                            .and_then(|v| {
-                                v.as_str()
-                                    .map(|s| s.to_string())
-                                    .or_else(|| v.as_i64().map(|n| n.to_string()))
-                            })
-                        {
-                            let file_url = content
-                                .get("data")
-                                .and_then(|d| d.get("url").or_else(|| d.get("fileUrl")))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let data = serde_json::json!({
-                                "fileUrl": file_url,
-                                "fileId": file_id.clone(),
-                            });
-                            let callback = ctx
-                                .upload_callbacks
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .remove(&file_id);
-                            if let Some(cb) = callback {
-                                cb(data).await;
-                            }
-                        }
-                    }
-                }
-            }
         }
         (510, 1) | (511, 1) => {
             let _ = event_tx.send(ListenerEvent::OldMessages(event_data));
@@ -524,7 +628,7 @@ async fn handle_binary_message(
         (502, 0) | (522, 0) | (602, 0) => {
             // TS filters GroupDeliveredMessage (cmd 522) by isSelf only.
             if cmd == 522 && !self_listen && is_self_event(&event_data) {
-                return;
+                return false;
             }
             let _ = event_tx.send(ListenerEvent::SeenDelivered(event_data));
         }
@@ -553,6 +657,54 @@ async fn handle_binary_message(
         }
         _ => {
             let _ = event_tx.send(ListenerEvent::Raw(payload));
+        }
+    }
+
+    false
+}
+
+/// Async upload completion callback (TS: listen.ts uploadCallbacks for
+/// file_done/send_file_done). Resolves the waiter registered by an upload so
+/// a sent file/voice does not stall until its timeout.
+async fn dispatch_file_done_callback(ctx: &ContextSession, event_data: &Value) {
+    if let Some(obj) = event_data.as_object() {
+        if let Some(content) = obj.get("content").and_then(|v| v.as_object()) {
+            let act = content.get("act").and_then(|v| v.as_str()).unwrap_or("");
+            let act_type = content
+                .get("act_type")
+                .or_else(|| content.get("actType"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if act_type == "file_done" && (act == "send_file_done" || act == "file_done") {
+                if let Some(file_id) = content
+                    .get("fileId")
+                    .or_else(|| content.get("file_id"))
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(|s| s.to_string())
+                            .or_else(|| v.as_i64().map(|n| n.to_string()))
+                    })
+                {
+                    let file_url = content
+                        .get("data")
+                        .and_then(|d| d.get("url").or_else(|| d.get("fileUrl")))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let data = serde_json::json!({
+                        "fileUrl": file_url,
+                        "fileId": file_id.clone(),
+                    });
+                    let callback = ctx
+                        .upload_callbacks
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&file_id);
+                    if let Some(cb) = callback {
+                        cb(data).await;
+                    }
+                }
+            }
         }
     }
 }
