@@ -43,7 +43,10 @@ pub async fn get_group_info(
     client: &ApiClient,
     group_ids: Vec<String>,
 ) -> Result<GetGroupInfoResponse> {
-    let url = client.service_url("group", "/api/group/getmg-v2")?;
+    let base_url = client.service_url("group", "/api/group/getmg-v2")?;
+    // `make_url` appends the `zpw_ver` / `zpw_type` markers the Zalo web API
+    // expects on every request.
+    let url = client.make_url(&base_url, &[("nretry", "0".to_string())], true)?;
     let mut grid_ver_map: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
     for id in group_ids {
         grid_ver_map.insert(id, 0);

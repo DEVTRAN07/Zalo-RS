@@ -32,7 +32,10 @@ pub async fn undo(
     } else {
         ("chat", "/api/message/undo")
     };
-    let url = client.service_url(service, path)?;
+    let base_url = client.service_url(service, path)?;
+    // `make_url` appends the `zpw_ver` / `zpw_type` markers the Zalo web API
+    // expects on every request.
+    let url = client.make_url(&base_url, &[("nretry", "0".to_string())], true)?;
 
     let client_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

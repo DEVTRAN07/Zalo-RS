@@ -40,7 +40,10 @@ pub struct WsPayload {
 #[derive(Debug, Clone)]
 pub enum ListenerEvent {
     Connected,
-    Disconnected { code: u16, reason: String },
+    Disconnected {
+        code: u16,
+        reason: String,
+    },
     CipherKey(String),
     Message(Value),
     GroupMessage(Value),
@@ -58,6 +61,9 @@ pub struct Listener {
     ctx: ContextSession,
     urls: Vec<String>,
     stop_tx: Option<mpsc::Sender<()>>,
+    /// Reconnect after a close/error. Defaults to `true` (the historical
+    /// behaviour); `listen()` sets it from `ListenOptions::retry_on_close`.
+    retry_on_close: bool,
 }
 
 impl Listener {
@@ -66,7 +72,16 @@ impl Listener {
             ctx,
             urls,
             stop_tx: None,
+            retry_on_close: true,
         }
+    }
+
+    /// Set whether the listener reconnects after the socket closes or
+    /// errors. With `false` it emits a single `Disconnected` event and
+    /// stops after the first close/error instead of retrying forever.
+    pub fn with_retry_on_close(mut self, retry_on_close: bool) -> Self {
+        self.retry_on_close = retry_on_close;
+        self
     }
 
     /// Start the listener and return a receiver for events.
@@ -77,7 +92,9 @@ impl Listener {
             return Err(ZaloError::Api(ZaloApiError::new("Already started")));
         }
         if self.urls.is_empty() {
-            return Err(ZaloError::Api(ZaloApiError::new("No WebSocket URLs available")));
+            return Err(ZaloError::Api(ZaloApiError::new(
+                "No WebSocket URLs available",
+            )));
         }
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -86,6 +103,7 @@ impl Listener {
 
         let ctx = self.ctx.clone();
         let urls = self.urls.clone();
+        let retry_on_close = self.retry_on_close;
 
         tokio::spawn(async move {
             let mut url_idx = 0usize;
@@ -114,27 +132,33 @@ impl Listener {
                     ("uid", base_ctx.uid.clone().unwrap_or_default()),
                     ("zpw_enk", base_ctx.secret_key.clone().unwrap_or_default()),
                 ];
-                let ws_url = crate::http::make_url(
-                    &base_ctx,
-                    base,
-                    &ws_query,
-                    true,
-                )
-                .unwrap_or_else(|_| {
-                    let sep = if base.contains('?') { '&' } else { '?' };
-                    format!("{}{}t={}&imei={}&uid={}&zpw_enk={}",
-                        base, sep, now_ms(),
-                        base_ctx.imei.clone().unwrap_or_default(),
-                        base_ctx.uid.clone().unwrap_or_default(),
-                        base_ctx.secret_key.clone().unwrap_or_default(),
-                    )
-                });
+                let ws_url = crate::http::make_url(&base_ctx, base, &ws_query, true)
+                    .unwrap_or_else(|_| {
+                        let sep = if base.contains('?') { '&' } else { '?' };
+                        format!(
+                            "{}{}t={}&imei={}&uid={}&zpw_enk={}",
+                            base,
+                            sep,
+                            now_ms(),
+                            base_ctx.imei.clone().unwrap_or_default(),
+                            base_ctx.uid.clone().unwrap_or_default(),
+                            base_ctx.secret_key.clone().unwrap_or_default(),
+                        )
+                    });
 
                 zlog_info!("Connecting to WebSocket: {}", ws_url);
                 zlog_verbose!("WS URL query params: t, imei, uid, zpw_enk | base={}", base);
                 let cipher_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-                let connect_result = connect_and_run(&ctx, &ws_url, event_tx.clone(), &mut stop_rx, cipher_key, ctx.options.self_listen).await;
+                let connect_result = connect_and_run(
+                    &ctx,
+                    &ws_url,
+                    event_tx.clone(),
+                    &mut stop_rx,
+                    cipher_key,
+                    ctx.options.self_listen,
+                )
+                .await;
 
                 match connect_result {
                     Ok(should_stop) => {
@@ -145,6 +169,13 @@ impl Listener {
                             });
                             break;
                         }
+                        if !retry_on_close {
+                            let _ = event_tx.send(ListenerEvent::Disconnected {
+                                code: CloseReason::AbnormalClosure as u16,
+                                reason: "closed".into(),
+                            });
+                            break;
+                        }
                         // Connection closed; try next endpoint after a short delay
                         url_idx = (url_idx + 1) % urls.len();
                         zlog_warn!("WebSocket closed, reconnecting...");
@@ -152,6 +183,9 @@ impl Listener {
                     }
                     Err(e) => {
                         let _ = event_tx.send(ListenerEvent::Error(e.to_string()));
+                        if !retry_on_close {
+                            break;
+                        }
                         url_idx = (url_idx + 1) % urls.len();
                         zlog_warn!("WebSocket error: {}, reconnecting...", e);
                         tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
@@ -180,17 +214,28 @@ async fn connect_and_run(
     self_listen: bool,
 ) -> Result<bool> {
     // Build request with headers matching the TypeScript client exactly.
-    let mut request = ws_url.into_client_request().map_err(|e| ZaloError::WebSocket(e.to_string()))?;
+    let mut request = ws_url
+        .into_client_request()
+        .map_err(|e| ZaloError::WebSocket(e.to_string()))?;
     let headers = request.headers_mut();
     headers.insert("Origin", HeaderValue::from_static("https://chat.zalo.me"));
     if let Ok(ua) = HeaderValue::from_str(&ctx.user_agent) {
         headers.insert("User-Agent", ua);
     }
-    headers.insert("Accept-Encoding", HeaderValue::from_static("gzip, deflate, br, zstd"));
-    headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
+    headers.insert(
+        "Accept-Encoding",
+        HeaderValue::from_static("gzip, deflate, br, zstd"),
+    );
+    headers.insert(
+        "Accept-Language",
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
     headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
     headers.insert("Pragma", HeaderValue::from_static("no-cache"));
-    headers.insert("Sec-WebSocket-Extensions", HeaderValue::from_static("permessage-deflate; client_max_window_bits"));
+    headers.insert(
+        "Sec-WebSocket-Extensions",
+        HeaderValue::from_static("permessage-deflate; client_max_window_bits"),
+    );
     // Cookie header: extract from cookie store
     if let Some(cookie_str) = get_cookie_header(ctx).await {
         if let Ok(v) = HeaderValue::from_str(&cookie_str) {
@@ -214,7 +259,8 @@ async fn connect_and_run(
     let (mut write, mut read) = ws_stream.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let ping_interval_ms = get_ping_interval_ms(ctx);
-    let mut ping_interval = tokio::time::interval(std::time::Duration::from_millis(ping_interval_ms));
+    let mut ping_interval =
+        tokio::time::interval(std::time::Duration::from_millis(ping_interval_ms));
     ping_interval.tick().await; // first tick is immediate
 
     // Writer task
@@ -266,7 +312,6 @@ async fn connect_and_run(
     }
 }
 
-
 /// Check if an event payload indicates it was sent by the current account.
 /// Returns true only when a clear boolean `isSelf` (or `data.isSelf`) is present and true.
 fn is_self_event(data: &Value) -> bool {
@@ -276,7 +321,11 @@ fn is_self_event(data: &Value) -> bool {
     if let Some(b) = data.get("isSelf").and_then(check) {
         return b;
     }
-    if let Some(b) = data.get("data").and_then(|d| d.get("isSelf")).and_then(check) {
+    if let Some(b) = data
+        .get("data")
+        .and_then(|d| d.get("isSelf"))
+        .and_then(check)
+    {
         return b;
     }
     false
@@ -304,7 +353,12 @@ async fn handle_binary_message(
         match serde_json::from_slice(payload_bytes) {
             Ok(v) => v,
             Err(e) => {
-                zlog_verbose!("Failed to parse WS payload JSON (cmd={}, sub={}): {}", cmd, sub_cmd, e);
+                zlog_verbose!(
+                    "Failed to parse WS payload JSON (cmd={}, sub={}): {}",
+                    cmd,
+                    sub_cmd,
+                    e
+                );
                 Value::Null
             }
         }
@@ -317,7 +371,12 @@ async fn handle_binary_message(
             *guard = Some(key.to_string());
             let _ = event_tx.send(ListenerEvent::CipherKey(key.to_string()));
             // Send initial ping
-            let _ = out_tx.send(encode_payload(1, 2, 1, &serde_json::json!({"eventId": now_ms()})));
+            let _ = out_tx.send(encode_payload(
+                1,
+                2,
+                1,
+                &serde_json::json!({"eventId": now_ms()}),
+            ));
             return;
         }
     }

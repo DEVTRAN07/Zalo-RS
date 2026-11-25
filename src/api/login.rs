@@ -31,7 +31,12 @@ pub async fn login(ctx: &ContextBase, encrypt_params: bool) -> Result<Option<Val
         .collect();
     query_params.push(("nretry", "0".to_string()));
 
-    let url = http::make_url(ctx, "https://wpa.chat.zalo.me/api/login/getLoginInfo", &query_params, true)?;
+    let url = http::make_url(
+        ctx,
+        "https://wpa.chat.zalo.me/api/login/getLoginInfo",
+        &query_params,
+        true,
+    )?;
 
     let response = http::post_form(ctx, &url, &[]).await?;
     if !response.status().is_success() {
@@ -100,11 +105,23 @@ pub async fn get_server_info(ctx: &ContextBase, encrypt_params: bool) -> Result<
         ))));
     }
 
-    let server: ServerInfo = serde_json::from_value(data["data"].clone()).unwrap_or_default();
+    // Do not swallow a malformed payload with `unwrap_or_default()`: a
+    // default `ServerInfo` (empty settings/versions) would only fail later
+    // in unrelated calls with a misleading error.
+    let server: ServerInfo = serde_json::from_value(data["data"].clone()).map_err(|e| {
+        ZaloError::Api(ZaloApiError::new(format!(
+            "Failed to parse server info: {}",
+            e
+        )))
+    })?;
     Ok(server)
 }
 
-fn get_encrypt_param(ctx: &ContextBase, encrypt_params: bool, api_name: &str) -> Result<EncryptParamResult> {
+fn get_encrypt_param(
+    ctx: &ContextBase,
+    encrypt_params: bool,
+    api_name: &str,
+) -> Result<EncryptParamResult> {
     let imei = ctx.imei.as_deref().unwrap_or_default();
     let language = ctx.language.as_deref().unwrap_or("vi");
     let ts = std::time::SystemTime::now()
@@ -134,13 +151,19 @@ fn get_encrypt_param(ctx: &ContextBase, encrypt_params: bool, api_name: &str) ->
             params.insert("params".to_string(), Value::String(ed));
         }
         params.insert("type".to_string(), Value::Number(ctx.api_type.into()));
-        params.insert("client_version".to_string(), Value::Number(ctx.api_version.into()));
+        params.insert(
+            "client_version".to_string(),
+            Value::Number(ctx.api_version.into()),
+        );
 
         let signkey = if api_name == "getserverinfo" {
             let mut sk_params = serde_json::Map::new();
             sk_params.insert("imei".into(), Value::String(imei.to_string()));
             sk_params.insert("type".into(), Value::Number(ctx.api_type.into()));
-            sk_params.insert("client_version".into(), Value::Number(ctx.api_version.into()));
+            sk_params.insert(
+                "client_version".into(),
+                Value::Number(ctx.api_version.into()),
+            );
             sk_params.insert("computer_name".into(), Value::String("Web".into()));
             get_sign_key(api_name, &sk_params)
         } else {
@@ -159,13 +182,19 @@ fn get_encrypt_param(ctx: &ContextBase, encrypt_params: bool, api_name: &str) ->
             }
         }
         params.insert("type".to_string(), Value::Number(ctx.api_type.into()));
-        params.insert("client_version".to_string(), Value::Number(ctx.api_version.into()));
+        params.insert(
+            "client_version".to_string(),
+            Value::Number(ctx.api_version.into()),
+        );
 
         let signkey = if api_name == "getserverinfo" {
             let mut sk_params = serde_json::Map::new();
             sk_params.insert("imei".into(), Value::String(imei.to_string()));
             sk_params.insert("type".into(), Value::Number(ctx.api_type.into()));
-            sk_params.insert("client_version".into(), Value::Number(ctx.api_version.into()));
+            sk_params.insert(
+                "client_version".into(),
+                Value::Number(ctx.api_version.into()),
+            );
             sk_params.insert("computer_name".into(), Value::String("Web".into()));
             get_sign_key(api_name, &sk_params)
         } else {
@@ -199,15 +228,22 @@ fn _encrypt_param(
 
     let encryptor = ParamsEncryptor::new(ctx.api_type, imei, first_launch_time).map_err(|e| {
         zlog_error!("Failed to create ParamsEncryptor: {}", e);
-        ZaloError::Api(ZaloApiError::new(format!("Failed to encrypt params: {}", e)))
+        ZaloError::Api(ZaloApiError::new(format!(
+            "Failed to encrypt params: {}",
+            e
+        )))
     })?;
 
     let stringified = serde_json::to_string(data)?;
     let encrypted_key = encryptor.get_encrypt_key().map_err(|e| {
-        ZaloError::Api(ZaloApiError::new(format!("Failed to get encrypt key: {}", e)))
+        ZaloError::Api(ZaloApiError::new(format!(
+            "Failed to get encrypt key: {}",
+            e
+        )))
     })?;
 
-    let encoded_data = crate::crypto::encode_aes_utf8_key(encrypted_key, &stringified, "base64", false);
+    let encoded_data =
+        crate::crypto::encode_aes_utf8_key(encrypted_key, &stringified, "base64", false);
     let params = encryptor.get_params();
 
     if params.is_none() {

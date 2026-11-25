@@ -28,7 +28,6 @@ pub enum AttachmentSource {
     },
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadAttachmentImageResponse {
@@ -102,21 +101,40 @@ impl RawUploadResponse {
             finished: value.get("finished").cloned().unwrap_or(Value::Null),
             client_file_id: value
                 .get("clientFileId")
-                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
                 .unwrap_or(0),
             chunk_id: value
                 .get("chunkId")
-                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
                 .unwrap_or(0),
-            file_id: value
-                .get("fileId")
-                .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string()))),
-            photo_id: value
-                .get("photoId")
-                .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string()))),
-            normal_url: value.get("normalUrl").and_then(|v| v.as_str()).map(ToString::to_string),
-            hd_url: value.get("hdUrl").and_then(|v| v.as_str()).map(ToString::to_string),
-            thumb_url: value.get("thumbUrl").and_then(|v| v.as_str()).map(ToString::to_string),
+            file_id: value.get("fileId").and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            }),
+            photo_id: value.get("photoId").and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            }),
+            normal_url: value
+                .get("normalUrl")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            hd_url: value
+                .get("hdUrl")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            thumb_url: value
+                .get("thumbUrl")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
         }
     }
 }
@@ -135,14 +153,19 @@ impl FileKind {
             FileKind::Video | FileKind::Other => "asyncfile/upload",
         }
     }
-
 }
 
 fn sharefile_setting_u64(settings: &Option<Value>, key: &str, default: u64) -> u64 {
     settings
         .as_ref()
         .and_then(|s| s.get("features").or_else(|| s.get("sharefile")))
-        .and_then(|s| if s.get(key).is_some() { Some(s) } else { s.get("sharefile") })
+        .and_then(|s| {
+            if s.get(key).is_some() {
+                Some(s)
+            } else {
+                s.get("sharefile")
+            }
+        })
         .and_then(|s| s.get(key))
         .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)))
         .unwrap_or(default)
@@ -158,7 +181,10 @@ fn restricted_extensions(settings: &Option<Value>) -> Vec<String> {
     values
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.trim_start_matches('.').to_ascii_lowercase()))
+                .filter_map(|v| {
+                    v.as_str()
+                        .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -246,14 +272,10 @@ fn image_dimensions(data: &[u8]) -> Option<(u64, u64)> {
             return Some((width, height));
         }
         if &data[12..16] == b"VP8X" && data.len() >= 30 {
-            let width = 1u64
-                + (data[24] as u64)
-                + ((data[25] as u64) << 8)
-                + ((data[26] as u64) << 16);
-            let height = 1u64
-                + (data[27] as u64)
-                + ((data[28] as u64) << 8)
-                + ((data[29] as u64) << 16);
+            let width =
+                1u64 + (data[24] as u64) + ((data[25] as u64) << 8) + ((data[26] as u64) << 16);
+            let height =
+                1u64 + (data[27] as u64) + ((data[28] as u64) << 8) + ((data[29] as u64) << 16);
             return Some((width, height));
         }
     }
@@ -287,7 +309,10 @@ async fn compute_checksum(source: &AttachmentSource, _total_size: u64) -> Result
     match source {
         AttachmentSource::Path(path) => {
             let bytes = fs::read(path).await.map_err(|e| {
-                ZaloError::Api(ZaloApiError::new(format!("Failed to read file {}: {}", path, e)))
+                ZaloError::Api(ZaloApiError::new(format!(
+                    "Failed to read file {}: {}",
+                    path, e
+                )))
             })?;
             hasher.update(&bytes);
         }
@@ -437,9 +462,13 @@ async fn upload_attachment_internal(
         }
 
         let (bytes, file_name) = file_bytes_and_name(&source).await?;
-        let ext = get_file_extension(if let AttachmentSource::Path(p) = &source { p } else { &file_name })
-            .trim_start_matches('.')
-            .to_ascii_lowercase();
+        let ext = get_file_extension(if let AttachmentSource::Path(p) = &source {
+            p
+        } else {
+            &file_name
+        })
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
         if !is_extension_valid(&ext, &settings) {
             return Err(ZaloError::Api(ZaloApiError::new(format!(
                 "File extension \"{}\" is not allowed",
@@ -490,30 +519,34 @@ async fn upload_attachment_internal(
         for (idx, chunk) in bytes.chunks(chunk_size).enumerate() {
             params.insert("chunkId".to_string(), Value::from((idx + 1) as i64));
             let params_value = Value::Object(params.clone());
-            let encrypted = client.encode_aes(&params_value.to_string()).ok_or_else(|| {
-                ZaloError::Api(ZaloApiError::new("Failed to encrypt message"))
-            })?;
+            let encrypted = client
+                .encode_aes(&params_value.to_string())
+                .ok_or_else(|| ZaloError::Api(ZaloApiError::new("Failed to encrypt message")))?;
 
-            let request_url = format!("{}?type={}&params={}", url_path, type_param, urlencoding::encode(&encrypted));
+            // `make_url` appends the `zpw_ver` / `zpw_type` markers the Zalo
+            // web API expects on every request (and URL-encodes the values).
+            let request_url = client.make_url(
+                &url_path,
+                &[
+                    ("type", type_param.to_string()),
+                    ("params", encrypted.clone()),
+                ],
+                true,
+            )?;
             let raw = post_chunk(client, &request_url, chunk.to_vec(), &file_name).await?;
             last_raw = Some(raw);
         }
 
-        let raw = last_raw.ok_or_else(|| ZaloError::Api(ZaloApiError::new("Empty upload response")))?;
+        let raw =
+            last_raw.ok_or_else(|| ZaloError::Api(ZaloApiError::new("Empty upload response")))?;
 
-        let valid = raw
-            .file_id
-            .as_deref()
-            .map(|id| id != "-1")
-            .unwrap_or(true)
-            && raw
-                .photo_id
-                .as_deref()
-                .map(|id| id != "-1")
-                .unwrap_or(true);
+        let valid = raw.file_id.as_deref().map(|id| id != "-1").unwrap_or(true)
+            && raw.photo_id.as_deref().map(|id| id != "-1").unwrap_or(true);
 
         if !valid {
-            return Err(ZaloError::Api(ZaloApiError::new("Upload rejected by server")));
+            return Err(ZaloError::Api(ZaloApiError::new(
+                "Upload rejected by server",
+            )));
         }
 
         match kind {
@@ -543,7 +576,9 @@ async fn upload_attachment_internal(
                     let callback: UploadCallback = Arc::new(move |data| {
                         let tx = tx.clone();
                         Box::pin(async move {
-                            if let Some(sender) = tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                            if let Some(sender) =
+                                tx.lock().unwrap_or_else(|e| e.into_inner()).take()
+                            {
                                 let _ = sender.send(data);
                             }
                         }) as Pin<Box<dyn Future<Output = ()> + Send>>
@@ -553,14 +588,19 @@ async fn upload_attachment_internal(
                         map.insert(file_id.clone(), callback);
                     }
 
-                    ws_data = timeout(Duration::from_secs(120), rx).await.ok().and_then(|r| r.ok());
+                    ws_data = timeout(Duration::from_secs(120), rx)
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok());
 
                     if let Ok(mut map) = client.ctx().upload_callbacks.lock() {
                         map.remove(&file_id);
                     }
                 }
 
-                let checksum = compute_checksum(&source, total_size).await.unwrap_or_default();
+                let checksum = compute_checksum(&source, total_size)
+                    .await
+                    .unwrap_or_default();
                 let file_url = ws_data
                     .as_ref()
                     .and_then(|d| d.get("fileUrl").or_else(|| d.get("file_url")))
@@ -570,7 +610,11 @@ async fn upload_attachment_internal(
                 let resolved_file_id = ws_data
                     .as_ref()
                     .and_then(|d| d.get("fileId").or_else(|| d.get("file_id")))
-                    .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string())))
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(|s| s.to_string())
+                            .or_else(|| v.as_i64().map(|n| n.to_string()))
+                    })
                     .unwrap_or(file_id);
 
                 if matches!(kind, FileKind::Video) {

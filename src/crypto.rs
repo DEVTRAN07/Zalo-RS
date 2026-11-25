@@ -3,10 +3,10 @@
 //! Implements MD5 signing, AES-CBC (zero IV, PKCS7) parameter encryption,
 //! response decryption, and the `ParamsEncryptor` used by login flows.
 
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use aes::Aes128;
 use aes::Aes192;
 use aes::Aes256;
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use md5::{Digest, Md5};
 use rand::Rng;
@@ -166,7 +166,10 @@ fn random_string(min: usize, max: usize) -> String {
         while remaining > 0 {
             let chunk = remaining.min(12);
             let v: u64 = rng.gen();
-            result.push_str(&format!("{:x}", v)[..chunk]);
+            // Zero-pad to 16 hex digits: an unpadded `{:x}` can be shorter
+            // than `chunk` (e.g. a small random value), and slicing it
+            // would panic with "byte index out of bounds".
+            result.push_str(&format!("{:016x}", v)[..chunk]);
             remaining -= chunk;
         }
         result.truncate(length);
@@ -323,4 +326,27 @@ pub fn encrypt_pin(pin: &str) -> String {
 /// Verifies a PIN against its stored hash.
 pub fn validate_pin(encrypted_pin: &str, pin: &str) -> bool {
     md5_hex(pin) == encrypted_pin
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: `random_string` used to slice an unpadded hex
+    /// string (`format!("{:x}", v)[..chunk]`), which panics whenever the
+    /// random value renders shorter than the requested chunk (about 1 in
+    /// a million per chunk for lengths above 12). Run many iterations so
+    /// the old code would almost certainly have panicked.
+    #[test]
+    fn random_string_never_panics_and_has_exact_length() {
+        for _ in 0..10_000 {
+            let s = random_string(13, 24);
+            assert!((13..=24).contains(&s.len()), "len {} for {s}", s.len());
+            assert!(s.chars().all(|c| c.is_ascii_hexdigit()), "{s}");
+        }
+        for _ in 0..1_000 {
+            let s = random_string(6, 12);
+            assert!((6..=12).contains(&s.len()), "len {} for {s}", s.len());
+        }
+    }
 }

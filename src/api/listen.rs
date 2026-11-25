@@ -18,20 +18,20 @@ pub struct ListenResponse {
     pub rx: mpsc::UnboundedReceiver<ListenerEvent>,
 }
 
-pub async fn listen(
-    client: &ApiClient,
-    options: Option<ListenOptions>,
-) -> Result<ListenResponse> {
-    let _ = options;
+pub async fn listen(client: &ApiClient, options: Option<ListenOptions>) -> Result<ListenResponse> {
+    // `retry_on_close` defaults to true when no options are given (the
+    // historical behaviour: reconnect forever until `stop()` is called).
+    let retry_on_close = options.as_ref().map(|o| o.retry_on_close).unwrap_or(true);
 
     let ws_urls = client.ws_urls().clone();
     if ws_urls.is_empty() {
         return Err(crate::errors::ZaloError::Api(
-            crate::errors::ZaloApiError::new("No WebSocket URLs available")
+            crate::errors::ZaloApiError::new("No WebSocket URLs available"),
         ));
     }
 
-    let mut listener = Listener::new(client.ctx().clone(), ws_urls.clone());
+    let mut listener =
+        Listener::new(client.ctx().clone(), ws_urls.clone()).with_retry_on_close(retry_on_close);
     let rx = listener.start()?;
 
     Ok(ListenResponse {

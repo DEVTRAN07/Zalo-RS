@@ -77,36 +77,44 @@ pub async fn handle_zalo_response<T: DeserializeOwned>(
     }
 
     let payload = if is_encrypted {
-        let data_str = match json.get("data").and_then(|v| v.as_str()) {
-            Some(s) => s,
+        // Encrypted responses carry `data` as an AES-encrypted string, but
+        // some endpoints return `data` as a plain JSON object instead. The
+        // TypeScript client handles both (`resolveResponse` only decrypts
+        // when `data` is a string); do the same instead of failing with
+        // "Encrypted response missing data field".
+        match json.get("data") {
+            Some(v) if !v.is_string() => json.clone(),
+            Some(v) => {
+                let data_str = v.as_str().unwrap_or_default();
+                match decode_aes(&ctx.secret_key, data_str) {
+                    Some(decoded) => match serde_json::from_str::<serde_json::Value>(&decoded) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return ZaloResponse {
+                                data: None,
+                                error: Some(ZaloResponseError {
+                                    message: format!("Failed to parse decrypted payload: {}", e),
+                                    code: None,
+                                }),
+                            }
+                        }
+                    },
+                    None => {
+                        return ZaloResponse {
+                            data: None,
+                            error: Some(ZaloResponseError {
+                                message: "Failed to decrypt response data".into(),
+                                code: None,
+                            }),
+                        }
+                    }
+                }
+            }
             None => {
                 return ZaloResponse {
                     data: None,
                     error: Some(ZaloResponseError {
                         message: "Encrypted response missing data field".into(),
-                        code: None,
-                    }),
-                }
-            }
-        };
-        match decode_aes(&ctx.secret_key, data_str) {
-            Some(decoded) => match serde_json::from_str::<serde_json::Value>(&decoded) {
-                Ok(v) => v,
-                Err(e) => {
-                    return ZaloResponse {
-                        data: None,
-                        error: Some(ZaloResponseError {
-                            message: format!("Failed to parse decrypted payload: {}", e),
-                            code: None,
-                        }),
-                    }
-                }
-            },
-            None => {
-                return ZaloResponse {
-                    data: None,
-                    error: Some(ZaloResponseError {
-                        message: "Failed to decrypt response data".into(),
                         code: None,
                     }),
                 }
@@ -169,4 +177,3 @@ pub async fn resolve_response<T: DeserializeOwned>(
         .data
         .ok_or_else(|| ZaloError::Api(ZaloApiError::new("Empty response data")))
 }
-

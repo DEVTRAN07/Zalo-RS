@@ -15,7 +15,9 @@ pub async fn get_sticker_category_detail(
     let encrypted = client
         .encode_aes(&params.to_string())
         .ok_or_else(|| ZaloError::Api(ZaloApiError::new("Failed to encrypt params")))?;
-    let url = if base_url.contains('?') { format!("{}&params={}", &base_url, urlencoding::encode(&encrypted)) } else { format!("{}?params={}", &base_url, urlencoding::encode(&encrypted)) };
+    // `make_url` appends the `zpw_ver` / `zpw_type` markers the Zalo web API
+    // expects on every request (and URL-encodes the values).
+    let url = client.make_url(&base_url, &[("params", encrypted)], true)?;
     let res = client.request_get(&url).await?;
     client.resolve(res).await
 }

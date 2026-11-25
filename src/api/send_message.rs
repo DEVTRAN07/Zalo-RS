@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::api::client::ApiClient;
+use crate::api::upload_attachment::{AttachmentSource, UploadAttachmentType};
 use crate::errors::{Result, ZaloApiError, ZaloError};
-use crate::api::upload_attachment::AttachmentSource;
 use crate::models::r#enum::ThreadType;
 
 /// Message urgency, mirrored into `metaData.urgency` (matches the TS `Urgency` enum).
@@ -67,7 +67,8 @@ fn insert_opt(map: &mut Map<String, Value>, key: &str, value: Option<Value>) {
 
 /// Extract msg_id from API response (handles both msgId and msg_id).
 fn extract_msg_id(response: Value) -> Result<i64> {
-    response.get("msgId")
+    response
+        .get("msgId")
         .or_else(|| response.get("msg_id"))
         .and_then(|v| v.as_i64())
         .ok_or_else(|| ZaloError::Api(ZaloApiError::new("Missing msg_id in response")))
@@ -139,7 +140,10 @@ pub async fn send_message(
 ///
 /// When only a plain text message is given the behaviour matches
 /// [`send_message`].
-pub async fn send_message_options(client: &ApiClient, options: SendMessageOptions) -> Result<SendMessageResponse> {
+pub async fn send_message_options(
+    client: &ApiClient,
+    options: SendMessageOptions,
+) -> Result<SendMessageResponse> {
     let SendMessageOptions {
         message,
         thread_id,
@@ -170,7 +174,11 @@ pub async fn send_message_options(client: &ApiClient, options: SendMessageOption
 
     let is_group = thread_type == ThreadType::Group;
     let service = if is_group { "group" } else { "chat" };
-    let root = if is_group { "/api/group" } else { "/api/message" };
+    let root = if is_group {
+        "/api/group"
+    } else {
+        "/api/message"
+    };
 
     let quote_present = quote_msg_id.is_some()
         || quote_owner_id.is_some()
@@ -186,7 +194,7 @@ pub async fn send_message_options(client: &ApiClient, options: SendMessageOption
     } else if mention_present && is_group {
         format!("{}/mention", root)
     } else if is_group {
-        "/api/group/ssendmsg".to_string()
+        "/api/group/sendmsg".to_string()
     } else {
         "/api/message/sms".to_string()
     };
@@ -198,26 +206,28 @@ pub async fn send_message_options(client: &ApiClient, options: SendMessageOption
 
     let message_empty = message.is_empty();
     let mut params = Map::new();
-    params.insert("message".to_string(), Value::String(message));
+    params.insert("message".to_string(), Value::String(message.clone()));
     params.insert("clientId".to_string(), Value::from(client_id));
     if !is_group || !quote_present {
         params.insert("imei".to_string(), Value::String(client.ctx().imei.clone()));
     }
     if is_group {
         params.insert("grid".to_string(), Value::String(thread_id.clone()));
-        params.insert("visibility".to_string(), Value::from(visibility.unwrap_or(0)));
+        params.insert(
+            "visibility".to_string(),
+            Value::from(visibility.unwrap_or(0)),
+        );
     } else {
         params.insert("toid".to_string(), Value::String(thread_id.clone()));
     }
     if is_group {
-        insert_opt(&mut params, "mentionInfo", mention_info);
+        insert_opt(&mut params, "mentionInfo", mention_info.clone());
     }
     params.insert("ttl".to_string(), Value::from(ttl.unwrap_or(0)));
     insert_opt(&mut params, "textProperties", text_properties);
-    let meta = meta_data.or_else(|| {
-        urgency.map(|u| serde_json::json!({ "urgency": u as i64 }))
-    });
-    insert_opt(&mut params, "metaData", meta);
+    let meta = meta_data.or_else(|| urgency.map(|u| serde_json::json!({ "urgency": u as i64 })));
+    insert_opt(&mut params, "metaData", meta.clone());
+    let attachment_meta = meta;
 
     if quote_present {
         insert_opt(&mut params, "qmsgOwner", quote_owner_id.map(Value::String));
@@ -236,16 +246,242 @@ pub async fn send_message_options(client: &ApiClient, options: SendMessageOption
 
     if has_attachments {
         let sources = attachments.expect("presence checked above");
-        let uploaded =
-            crate::api::upload_attachment::upload_attachment(client, sources, &thread_id, thread_type)
-                .await?;
-        if message_empty {
-            let msg_id = extract_msg_id(serde_json::to_value(&uploaded).unwrap_or(Value::Null))?;
-            return Ok(SendMessageResponse { msg_id });
+        // Mirrors the TypeScript `sendMessage` attachment flow
+        // (zca-js `src/apis/sendMessage.ts`, `handleAttachment`): the text
+        // rides along as the image description only for a single
+        // jpg/jpeg/png/webp attachment without a quote; otherwise the text
+        // is sent first as its own message and the attachments follow with
+        // an empty description.
+        let can_be_desc = can_carry_text_as_desc(&sources);
+        let mut desc = message.clone();
+        if !message_empty && (!can_be_desc || quote_present) {
+            let response = client.post_encrypted(&url, &params).await?;
+            let _ = extract_msg_id(response)?;
+            desc = String::new();
         }
+        let uploaded = crate::api::upload_attachment::upload_attachment(
+            client,
+            sources,
+            &thread_id,
+            thread_type,
+        )
+        .await?;
+        let msg_id = send_uploaded_attachments(
+            client,
+            &uploaded,
+            &thread_id,
+            thread_type,
+            &desc,
+            mention_info.as_ref(),
+            can_be_desc && !quote_present,
+            ttl,
+            attachment_meta.as_ref(),
+        )
+        .await?;
+        return Ok(SendMessageResponse { msg_id });
     }
 
     let response = client.post_encrypted(&url, &params).await?;
     let msg_id = extract_msg_id(response)?;
     Ok(SendMessageResponse { msg_id })
+}
+
+/// File extension (lowercase, without the dot) of an attachment source.
+fn attachment_extension(source: &AttachmentSource) -> String {
+    let name = match source {
+        AttachmentSource::Path(p) => p.as_str(),
+        AttachmentSource::Inline { filename, .. } => filename.as_str(),
+    };
+    crate::core::utils::get_file_extension(name).to_ascii_lowercase()
+}
+
+/// Whether the text can be sent together with the attachments as the image
+/// description: exactly one attachment and it is an image (jpg/jpeg/png/webp).
+/// Mirrors the TypeScript `canBeDesc` check.
+fn can_carry_text_as_desc(sources: &[AttachmentSource]) -> bool {
+    sources.len() == 1
+        && matches!(
+            attachment_extension(&sources[0]).as_str(),
+            "jpg" | "jpeg" | "png" | "webp"
+        )
+}
+
+/// Send already-uploaded attachments through the per-type endpoints, exactly
+/// like the TypeScript `handleAttachment` does:
+///
+/// - image  -> `{file}/api/{group|message}/photo_original/send?`
+/// - video / other file -> `{file}/api/{group|message}/asyncfile/msg?`
+///
+/// Returns the `msg_id` of the last attachment sent (the TypeScript client
+/// returns one result per attachment; this API returns a single `msg_id`).
+async fn send_uploaded_attachments(
+    client: &ApiClient,
+    uploaded: &[UploadAttachmentType],
+    thread_id: &str,
+    thread_type: ThreadType,
+    desc: &str,
+    mention_info: Option<&Value>,
+    can_be_desc: bool,
+    ttl: Option<i64>,
+    meta_data: Option<&Value>,
+) -> Result<i64> {
+    let is_group = thread_type == ThreadType::Group;
+    let is_multi = uploaded.len() > 1;
+    // TypeScript `getGroupLayoutId()` returns `Date.now()`.
+    let group_layout_id = chrono::Utc::now().timestamp_millis();
+    let mut client_id = chrono::Utc::now().timestamp_millis();
+    // TypeScript counts down from `uploadAttachment.length - 1`.
+    let mut index_in_group = uploaded.len() as i64 - 1;
+    let mut last_msg_id = 0i64;
+
+    for att in uploaded {
+        let (path, mut params) = match att {
+            UploadAttachmentType::Image(img) => {
+                let mut p = serde_json::json!({
+                    "photoId": img.photo_id,
+                    "clientId": client_id.to_string(),
+                    "desc": desc,
+                    "width": img.width,
+                    "height": img.height,
+                    "rawUrl": img.normal_url,
+                    "hdUrl": img.hd_url,
+                    "thumbUrl": img.thumb_url,
+                    "hdSize": img.total_size.to_string(),
+                    "zsource": -1,
+                    "ttl": ttl.unwrap_or(0),
+                    "jcp": "{\"convertible\":\"jxl\"}",
+                });
+                if is_group {
+                    p["grid"] = Value::String(thread_id.to_string());
+                    p["oriUrl"] = Value::String(img.normal_url.clone());
+                } else {
+                    p["toid"] = Value::String(thread_id.to_string());
+                    p["normalUrl"] = Value::String(img.normal_url.clone());
+                }
+                if is_multi {
+                    p["groupLayoutId"] = Value::from(group_layout_id);
+                    p["isGroupLayout"] = Value::from(1);
+                    p["idInGroup"] = Value::from(index_in_group);
+                    p["totalItemInGroup"] = Value::from(uploaded.len() as i64);
+                }
+                // Mentions only ride on a single image that carries the text
+                // as its description, without a quote (TypeScript).
+                if !is_multi && can_be_desc && is_group {
+                    if let Some(m) = mention_info {
+                        p["mentionInfo"] = m.clone();
+                    }
+                }
+                let path = if is_group {
+                    "/api/group/photo_original/send"
+                } else {
+                    "/api/message/photo_original/send"
+                };
+                (path, p)
+            }
+            UploadAttachmentType::Video(_) | UploadAttachmentType::File(_) => {
+                // `Video` and `File` share the same send shape; extract the
+                // fields through a common tuple (the two response structs
+                // are different types, so one or-pattern binding cannot
+                // cover both).
+                let (file_id, checksum, total_size, file_name, client_file_id, file_url) = match att
+                {
+                    UploadAttachmentType::Video(v) => (
+                        v.file_id.clone(),
+                        v.checksum.clone(),
+                        v.total_size,
+                        v.file_name.clone(),
+                        v.client_file_id,
+                        v.file_url.clone(),
+                    ),
+                    UploadAttachmentType::File(f) => (
+                        f.file_id.clone(),
+                        f.checksum.clone(),
+                        f.total_size,
+                        f.file_name.clone(),
+                        f.client_file_id,
+                        f.file_url.clone(),
+                    ),
+                    UploadAttachmentType::Image(_) => unreachable!(),
+                };
+                let mut p = serde_json::json!({
+                    "fileId": file_id,
+                    "checksum": checksum,
+                    // Note the misspelling: the Zalo API expects `extention`.
+                    "extention": crate::core::utils::get_file_extension(&file_name)
+                        .to_ascii_lowercase(),
+                    "checksumSha": "",
+                    "totalSize": total_size,
+                    "fileName": file_name,
+                    "clientId": client_file_id,
+                    "fType": 1,
+                    "fileCount": 0,
+                    "fdata": "{}",
+                    "fileUrl": file_url,
+                    "zsource": -1,
+                    "ttl": ttl.unwrap_or(0),
+                });
+                if is_group {
+                    p["grid"] = Value::String(thread_id.to_string());
+                } else {
+                    p["toid"] = Value::String(thread_id.to_string());
+                }
+                let path = if is_group {
+                    "/api/group/asyncfile/msg"
+                } else {
+                    "/api/message/asyncfile/msg"
+                };
+                (path, p)
+            }
+        };
+        // Urgency/metaData ride on every attachment send, like the
+        // TypeScript `handleUrgency(data.params, urgency)` call.
+        if let Some(m) = meta_data {
+            params["metaData"] = m.clone();
+        }
+        client_id += 1;
+        index_in_group -= 1;
+
+        let base_url = client.service_url("file", path)?;
+        let url = client.make_url(&base_url, &[("nretry", "0".to_string())], true)?;
+        let response: Value = client.post_encrypted(&url, &params).await?;
+        last_msg_id = extract_msg_id(response)?;
+    }
+
+    Ok(last_msg_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_extension_is_lowercase_without_dot() {
+        assert_eq!(
+            attachment_extension(&AttachmentSource::Path("/tmp/Photo.JPG".into())),
+            "jpg"
+        );
+        assert_eq!(
+            attachment_extension(&AttachmentSource::Inline {
+                filename: "clip.PNG".into(),
+                data: vec![],
+                metadata: Value::Null,
+            }),
+            "png"
+        );
+        assert_eq!(
+            attachment_extension(&AttachmentSource::Path("/tmp/noext".into())),
+            ""
+        );
+    }
+
+    #[test]
+    fn can_carry_text_as_desc_only_single_image() {
+        let img = AttachmentSource::Path("/tmp/a.jpg".into());
+        let img2 = AttachmentSource::Path("/tmp/b.png".into());
+        let vid = AttachmentSource::Path("/tmp/c.mp4".into());
+        assert!(can_carry_text_as_desc(std::slice::from_ref(&img)));
+        assert!(!can_carry_text_as_desc(&[img.clone(), img2]));
+        assert!(!can_carry_text_as_desc(std::slice::from_ref(&vid)));
+        assert!(!can_carry_text_as_desc(&[]));
+    }
 }
