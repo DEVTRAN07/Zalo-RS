@@ -106,6 +106,27 @@ fn reaction_spec(icon: &Value) -> Option<(i64, i64, String)> {
     Some((r_type, source, name.to_string()))
 }
 
+/// Parse the message ids a reaction targets.
+///
+/// Both ids must be decimal numbers: silently substituting `0` for an
+/// unparsable id (the old `unwrap_or(0)` behaviour) would send the reaction
+/// to the wrong message — or make Zalo reject it with an opaque error and
+/// no clue that the id had been replaced. Fail loudly instead so the
+/// caller sees `Invalid msgId` / `Invalid cliMsgId`.
+fn parse_reaction_msg_ids(dest: &AddReactionDestination) -> Result<(i64, i64)> {
+    let g_msg_id = dest
+        .data
+        .msg_id
+        .parse::<i64>()
+        .map_err(|_| ZaloError::Api(ZaloApiError::new("Invalid msgId")))?;
+    let c_msg_id = dest
+        .data
+        .cli_msg_id
+        .parse::<i64>()
+        .map_err(|_| ZaloError::Api(ZaloApiError::new("Invalid cliMsgId")))?;
+    Ok((g_msg_id, c_msg_id))
+}
+
 /// Add reaction to a message. `icon` can be a reaction name (e.g. "HEART")
 /// or a custom object with `rType`, `source`, `icon`.
 pub async fn add_reaction(
@@ -119,6 +140,8 @@ pub async fn add_reaction(
         return Err(ZaloError::Api(ZaloApiError::new("Invalid reaction")));
     }
 
+    let (g_msg_id, c_msg_id) = parse_reaction_msg_ids(&dest)?;
+
     let is_group = matches!(dest.thread_type, ThreadType::Group);
     let path = if is_group { "/api/group/reaction" } else { "/api/message/reaction" };
     let url = client.service_url("reaction", path)?;
@@ -126,8 +149,16 @@ pub async fn add_reaction(
 
     let react_msg = serde_json::json!({
         "rMsg": [{
-            "gMsgID": dest.data.msg_id.parse::<i64>().unwrap_or(0),
-            "cMsgID": dest.data.cli_msg_id.parse::<i64>().unwrap_or(0),
+            "gMsgID": g_msg_id,
+            "cMsgID": c_msg_id,
+            // NOTE: msgType is hardcoded to 1 (text message) because the
+            // caller does not pass the target message's real type — neither
+            // `add_reaction` nor `AddReactionDestination` carries one. A
+            // reaction to a non-text message (image/sticker/video, whose
+            // msgType != 1) may therefore not apply; if that is ever
+            // needed, thread the real msgType through
+            // `AddReactionDestination` (defaulting to 1) instead of
+            // changing this literal.
             "msgType": 1,
         }],
         "rIcon": r_icon,
@@ -154,4 +185,45 @@ pub async fn add_reaction(
     }
 
     client.post_encrypted(&url, &params).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dest(msg_id: &str, cli_msg_id: &str) -> AddReactionDestination {
+        AddReactionDestination {
+            data: AddReactionMessageData {
+                msg_id: msg_id.to_string(),
+                cli_msg_id: cli_msg_id.to_string(),
+            },
+            thread_id: "123".to_string(),
+            thread_type: ThreadType::Group,
+        }
+    }
+
+    #[test]
+    fn parse_reaction_msg_ids_accepts_numeric_ids() {
+        let (g, c) = parse_reaction_msg_ids(&dest("123", "456")).unwrap();
+        assert_eq!((g, c), (123, 456));
+    }
+
+    #[test]
+    fn parse_reaction_msg_ids_rejects_bad_msg_id() {
+        let err = parse_reaction_msg_ids(&dest("not-a-number", "456")).unwrap_err();
+        assert!(err.to_string().contains("Invalid msgId"));
+    }
+
+    #[test]
+    fn parse_reaction_msg_ids_rejects_bad_cli_msg_id() {
+        let err = parse_reaction_msg_ids(&dest("123", "not-a-number")).unwrap_err();
+        assert!(err.to_string().contains("Invalid cliMsgId"));
+    }
+
+    #[test]
+    fn parse_reaction_msg_ids_rejects_empty_ids() {
+        // Empty ids used to silently become 0 and target the wrong message.
+        assert!(parse_reaction_msg_ids(&dest("", "456")).is_err());
+        assert!(parse_reaction_msg_ids(&dest("123", "")).is_err());
+    }
 }
