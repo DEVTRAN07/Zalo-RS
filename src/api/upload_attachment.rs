@@ -93,6 +93,10 @@ struct RawUploadResponse {
     normal_url: Option<String>,
     hd_url: Option<String>,
     thumb_url: Option<String>,
+    /// Direct file URL if the chunk response itself carries one
+    /// (`fileUrl`/`file_url`). Used as a fallback when the `file_done`
+    /// WS event never arrives, so the upload does not end with an empty URL.
+    file_url: Option<String>,
 }
 
 impl RawUploadResponse {
@@ -133,6 +137,11 @@ impl RawUploadResponse {
                 .map(ToString::to_string),
             thumb_url: value
                 .get("thumbUrl")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            file_url: value
+                .get("fileUrl")
+                .or_else(|| value.get("file_url"))
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string),
         }
@@ -321,20 +330,133 @@ fn checksum_bytes(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Register the `file_done` WS callback for `file_id` and return the
+/// receiver the upload waits on. The WS dispatcher (`ws/mod.rs`) drops a
+/// `file_done` event whose `file_id` has no registered callback, so the
+/// callback must exist *before* the server can emit the event — i.e.
+/// before the final chunk is POSTed (see the chunk loop), not after.
+fn register_upload_callback(client: &ApiClient, file_id: &str) -> oneshot::Receiver<Value> {
+    let (tx, rx) = oneshot::channel::<Value>();
+    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+    let callback: UploadCallback = Arc::new(move |data| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            if let Some(sender) = tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = sender.send(data);
+            }
+        }) as Pin<Box<dyn Future<Output = ()> + Send>>
+    });
+    if let Ok(mut map) = client.ctx().upload_callbacks.lock() {
+        map.insert(file_id.to_string(), callback);
+    }
+    rx
+}
+
+fn unregister_upload_callback(client: &ApiClient, file_id: &str) {
+    if let Ok(mut map) = client.ctx().upload_callbacks.lock() {
+        map.remove(file_id);
+    }
+}
+
+/// Pick the URL to send the message with. `file_done` data wins; the chunk
+/// response's own `fileUrl` is the fallback. Never returns an empty URL:
+/// a caller that sent an empty `fileUrl` would fail downstream anyway, so
+/// fail loudly here instead of stalling the bot and then sending a broken
+/// message.
+fn resolve_file_url(ws_data: Option<&Value>, raw_file_url: Option<&str>) -> Result<String> {
+    let from_ws = ws_data
+        .and_then(|d| d.get("fileUrl").or_else(|| d.get("file_url")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !from_ws.is_empty() {
+        return Ok(from_ws.to_string());
+    }
+    if let Some(url) = raw_file_url.filter(|u| !u.is_empty()) {
+        return Ok(url.to_string());
+    }
+    Err(ZaloError::Api(ZaloApiError::new(
+        "Upload finished without a fileUrl (file_done event never arrived)",
+    )))
+}
+
+/// Check an upload envelope for an error code, unwrap its `data` field,
+/// and build the typed response. `data` must be an object: the old code
+/// passed a string `data` straight into `RawUploadResponse::from_value`,
+/// which silently produced an all-empty struct (empty URL) for an
+/// encrypted response that was never decrypted.
+fn raw_from_envelope(value: Value) -> Result<RawUploadResponse> {
+    if let Some(error_code) = value.get("error_code").and_then(|v| v.as_i64()) {
+        if error_code != 0 {
+            let msg = value
+                .get("error_message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Upload error")
+                .to_string();
+            return Err(ZaloError::Api(ZaloApiError::with_code(msg, error_code)));
+        }
+    }
+    let data = value.get("data").cloned().unwrap_or(value);
+    if let Some(error_code) = data.get("error_code").and_then(|v| v.as_i64()) {
+        if error_code != 0 {
+            let msg = data
+                .get("error_message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Upload error")
+                .to_string();
+            return Err(ZaloError::Api(ZaloApiError::with_code(msg, error_code)));
+        }
+    }
+    if !data.is_object() {
+        return Err(ZaloError::Api(ZaloApiError::new(
+            "Failed to parse upload response: data is not an object (encrypted response?)",
+        )));
+    }
+    Ok(RawUploadResponse::from_value(data))
+}
+
+/// If `value` carries `data` as an encrypted string, decrypt it (same
+/// AES scheme as `factory::handle_zalo_response`) and parse the result.
+/// Returns `None` when `data` is not a string or decryption/parsing fails,
+/// in which case the caller falls through to the plain path.
+fn try_decrypt_data_field(client: &ApiClient, value: &Value) -> Option<Value> {
+    let data_str = value.get("data")?.as_str()?;
+    let decoded = crate::crypto::decode_aes(&client.ctx().secret_key, data_str)?;
+    serde_json::from_str::<Value>(&decoded).ok()
+}
+
+/// Parse an upload response body: plain JSON first, then — as the old
+/// comment promised but never implemented — fall back to the encrypted
+/// resolver when `data` is an encrypted string, or when the whole body is
+/// a raw encrypted string.
+fn parse_upload_response(client: &ApiClient, body: &[u8]) -> Result<RawUploadResponse> {
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        if let Some(decrypted) = try_decrypt_data_field(client, &value) {
+            return raw_from_envelope(decrypted);
+        }
+        return raw_from_envelope(value);
+    }
+    // Not JSON at all: the body itself may be a raw encrypted string.
+    if let Ok(text) = std::str::from_utf8(body) {
+        let text = text.trim();
+        if !text.is_empty() {
+            if let Some(decoded) = crate::crypto::decode_aes(&client.ctx().secret_key, text) {
+                if let Ok(value) = serde_json::from_str::<Value>(&decoded) {
+                    return raw_from_envelope(value);
+                }
+            }
+        }
+    }
+    Err(ZaloError::Api(ZaloApiError::new(
+        "Failed to parse upload response",
+    )))
+}
+
 async fn post_chunk(
     client: &ApiClient,
     request_url: &str,
     chunk: Vec<u8>,
     filename: &str,
 ) -> Result<RawUploadResponse> {
-    let form = reqwest::multipart::Form::new().part(
-        "chunkContent",
-        reqwest::multipart::Part::bytes(chunk)
-            .file_name(filename.to_string())
-            .mime_str("application/octet-stream")
-            .unwrap_or_else(|_| reqwest::multipart::Part::bytes(Vec::new())),
-    );
-
     let base = client.ctx_to_base();
     let http = crate::http::get_http(&base).await?;
     let mut headers = reqwest::header::HeaderMap::new();
@@ -350,53 +472,78 @@ async fn post_chunk(
         headers.insert(reqwest::header::USER_AGENT, ua);
     }
 
-    let resp = http
-        .client
-        .post(request_url)
-        .headers(headers)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(ZaloError::Http)?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(ZaloError::Api(ZaloApiError::new(format!(
-            "Upload failed with status {}",
-            status
-        ))));
-    }
-
-    // Upload responses are typically plain JSON; attempt plain parse first, fall back to encrypted resolver.
-    let body = resp.bytes().await.map_err(ZaloError::Http)?;
-    if let Ok(value) = serde_json::from_slice::<Value>(&body) {
-        if let Some(error_code) = value.get("error_code").and_then(|v| v.as_i64()) {
-            if error_code != 0 {
-                let msg = value
-                    .get("error_message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Upload error")
-                    .to_string();
-                return Err(ZaloError::Api(ZaloApiError::with_code(msg, error_code)));
+    // The old code sent the chunk with no per-request timeout (the client
+    // only has a 5s *connect* timeout) and no retry, so a stalled chunk
+    // hung the send task forever. Retry 429/5xx + transport errors with
+    // the session's retry policy; a chunk POST is idempotent (same
+    // clientId + chunkId re-uploads the same chunk), and each attempt gets
+    // the policy timeout (default 60s) instead of hanging indefinitely.
+    // (`http::request` cannot be used here: it only sends string bodies,
+    // not multipart forms.)
+    let policy = &client.ctx().options.retry;
+    let attempts = policy.limit.saturating_add(1).max(1);
+    let per_attempt_timeout = if policy.timeout_ms > 0 {
+        Duration::from_millis(policy.timeout_ms)
+    } else {
+        Duration::from_secs(60)
+    };
+    let mut last_err: Option<ZaloError> = None;
+    for attempt in 0..attempts {
+        let form = reqwest::multipart::Form::new().part(
+            "chunkContent",
+            reqwest::multipart::Part::bytes(chunk.clone())
+                .file_name(filename.to_string())
+                .mime_str("application/octet-stream")
+                .unwrap_or_else(|_| reqwest::multipart::Part::bytes(Vec::new())),
+        );
+        let send = http
+            .client
+            .post(request_url)
+            .headers(headers.clone())
+            .multipart(form)
+            .timeout(per_attempt_timeout)
+            .send()
+            .await;
+        match send {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    // Retry rate-limits / server errors; fail fast otherwise.
+                    let retryable =
+                        status.as_u16() == 429 || status.is_server_error();
+                    if retryable && attempt + 1 < attempts {
+                        let wait = policy
+                            .delay_ms
+                            .saturating_mul(2u64.saturating_pow(attempt))
+                            .min(policy.max_delay_ms);
+                        tokio::time::sleep(Duration::from_millis(wait)).await;
+                        continue;
+                    }
+                    return Err(ZaloError::Api(ZaloApiError::new(format!(
+                        "Upload failed with status {}",
+                        status
+                    ))));
+                }
+                let body = resp.bytes().await.map_err(ZaloError::Http)?;
+                return parse_upload_response(client, &body);
+            }
+            Err(e) => {
+                if attempt + 1 < attempts {
+                    last_err = Some(ZaloError::Http(e));
+                    let wait = policy
+                        .delay_ms
+                        .saturating_mul(2u64.saturating_pow(attempt))
+                        .min(policy.max_delay_ms);
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                    continue;
+                }
+                return Err(ZaloError::Http(e));
             }
         }
-        let data = value.get("data").cloned().unwrap_or(value);
-        if let Some(error_code) = data.get("error_code").and_then(|v| v.as_i64()) {
-            if error_code != 0 {
-                let msg = data
-                    .get("error_message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Upload error")
-                    .to_string();
-                return Err(ZaloError::Api(ZaloApiError::with_code(msg, error_code)));
-            }
-        }
-        return Ok(RawUploadResponse::from_value(data));
     }
-
-    Err(ZaloError::Api(ZaloApiError::new(
-        "Failed to parse upload response",
-    )))
+    Err(last_err.unwrap_or_else(|| {
+        ZaloError::Api(ZaloApiError::new("Upload failed: retry loop ended without a result"))
+    }))
 }
 
 pub async fn upload_attachment(
@@ -528,6 +675,12 @@ async fn upload_attachment_internal(
         );
 
         let mut last_raw: Option<RawUploadResponse> = None;
+        // Receiver for the `file_done` WS event, registered as soon as the
+        // server first returns a file id. Images never wait for `file_done`,
+        // so only file/video uploads register.
+        let needs_file_done = matches!(kind, FileKind::Video | FileKind::Other);
+        let mut upload_rx: Option<oneshot::Receiver<Value>> = None;
+        let mut upload_file_id: Option<String> = None;
         for (idx, chunk) in bytes.chunks(chunk_size).enumerate() {
             params.insert("chunkId".to_string(), Value::from((idx + 1) as i64));
             let params_value = Value::Object(params.clone());
@@ -545,7 +698,36 @@ async fn upload_attachment_internal(
                 ],
                 true,
             )?;
-            let raw = post_chunk(client, &request_url, chunk.to_vec(), &file_name).await?;
+            let raw = match post_chunk(client, &request_url, chunk.to_vec(), &file_name).await {
+                Ok(raw) => raw,
+                Err(e) => {
+                    // Do not leak a callback registered for an upload that
+                    // will never complete.
+                    if let Some(fid) = &upload_file_id {
+                        unregister_upload_callback(client, fid);
+                    }
+                    return Err(e);
+                }
+            };
+            // Race fix: the server emits `file_done` as soon as the final
+            // chunk lands, and the WS dispatcher drops the event if no
+            // callback is registered for that file id yet. The file id is
+            // normally already present in the first chunk response, so
+            // register here — before the final chunk is POSTed — instead
+            // of only after the whole upload (the old code registered
+            // after the last chunk, then waited up to 120s for an event
+            // that had already been dropped, and sent an empty URL).
+            // Single-chunk uploads still register right after their only
+            // chunk; that residual window can only be closed by stashing
+            // early events in the WS dispatcher itself (follow-up outside
+            // this file), so a missing event now fails loudly below
+            // instead of producing an empty URL.
+            if needs_file_done && upload_rx.is_none() {
+                if let Some(fid) = raw.file_id.clone().filter(|s| !s.is_empty()) {
+                    upload_rx = Some(register_upload_callback(client, &fid));
+                    upload_file_id = Some(fid);
+                }
+            }
             last_raw = Some(raw);
         }
 
@@ -556,6 +738,9 @@ async fn upload_attachment_internal(
             && raw.photo_id.as_deref().map(|id| id != "-1").unwrap_or(true);
 
         if !valid {
+            if let Some(fid) = &upload_file_id {
+                unregister_upload_callback(client, fid);
+            }
             return Err(ZaloError::Api(ZaloApiError::new(
                 "Upload rejected by server",
             )));
@@ -580,44 +765,35 @@ async fn upload_attachment_internal(
             }
             FileKind::Video | FileKind::Other => {
                 let file_id = raw.file_id.clone().unwrap_or_default();
-                let mut ws_data: Option<Value> = None;
-
-                if !file_id.is_empty() {
-                    let (tx, rx) = oneshot::channel::<Value>();
-                    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
-                    let callback: UploadCallback = Arc::new(move |data| {
-                        let tx = tx.clone();
-                        Box::pin(async move {
-                            if let Some(sender) =
-                                tx.lock().unwrap_or_else(|e| e.into_inner()).take()
-                            {
-                                let _ = sender.send(data);
-                            }
-                        }) as Pin<Box<dyn Future<Output = ()> + Send>>
-                    });
-
-                    if let Ok(mut map) = client.ctx().upload_callbacks.lock() {
-                        map.insert(file_id.clone(), callback);
-                    }
-
-                    ws_data = timeout(Duration::from_secs(120), rx)
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok());
-
-                    if let Ok(mut map) = client.ctx().upload_callbacks.lock() {
-                        map.remove(&file_id);
-                    }
+                // If the file id only appeared in the last chunk response
+                // (e.g. a single-chunk upload), register now, immediately
+                // after the upload — the early-registration path above
+                // already handled the multi-chunk case.
+                if upload_rx.is_none() && !file_id.is_empty() {
+                    upload_rx = Some(register_upload_callback(client, &file_id));
+                    upload_file_id = Some(file_id.clone());
                 }
+
+                let ws_data: Option<Value> = match upload_rx {
+                    Some(rx) => {
+                        let data = timeout(Duration::from_secs(120), rx)
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok());
+                        if let Some(fid) = &upload_file_id {
+                            unregister_upload_callback(client, fid);
+                        }
+                        data
+                    }
+                    None => None,
+                };
 
                 // Checksum over the buffer already in RAM — no second read.
                 let checksum = checksum_bytes(&bytes);
-                let file_url = ws_data
-                    .as_ref()
-                    .and_then(|d| d.get("fileUrl").or_else(|| d.get("file_url")))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
+                // Never send an empty URL: fall back to the chunk
+                // response's own fileUrl, else fail loudly instead of
+                // waiting 120s and then sending a broken message.
+                let file_url = resolve_file_url(ws_data.as_ref(), raw.file_url.as_deref())?;
                 let resolved_file_id = ws_data
                     .as_ref()
                     .and_then(|d| d.get("fileId").or_else(|| d.get("file_id")))
@@ -687,5 +863,64 @@ mod tests {
             checksum_bytes(b""),
             "d41d8cd98f00b204e9800998ecf8427e"
         );
+    }
+
+    #[test]
+    fn raw_from_envelope_unwraps_data_and_rejects_string_data() {
+        // Plain object inside `data`.
+        let raw = raw_from_envelope(serde_json::json!({
+            "error_code": 0,
+            "data": {"fileId": "42", "fileUrl": "https://x/y", "clientFileId": 7, "chunkId": 1}
+        }))
+        .unwrap();
+        assert_eq!(raw.file_id.as_deref(), Some("42"));
+        assert_eq!(raw.file_url.as_deref(), Some("https://x/y"));
+
+        // Encrypted-style `data` as a string must NOT silently become an
+        // empty struct with an empty URL — it is an error until decrypted
+        // (see `try_decrypt_data_field` / `parse_upload_response`).
+        assert!(raw_from_envelope(serde_json::json!({
+            "error_code": 0,
+            "data": "U2FsdGVkX1+encrypted..."
+        }))
+        .is_err());
+
+        // Non-zero error codes surface.
+        assert!(raw_from_envelope(
+            serde_json::json!({"error_code": 5, "error_message": "nope"})
+        )
+        .is_err());
+        assert!(raw_from_envelope(serde_json::json!({
+            "error_code": 0,
+            "data": {"error_code": 9, "error_message": "bad"}
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn resolve_file_url_prefers_ws_event_then_raw_fallback_then_errors() {
+        // file_done data wins.
+        assert_eq!(
+            resolve_file_url(
+                Some(&serde_json::json!({"fileUrl": "https://ws/url", "fileId": "1"})),
+                Some("https://raw/url"),
+            )
+            .unwrap(),
+            "https://ws/url"
+        );
+        // No WS event yet the chunk response carried a URL: use it instead
+        // of an empty string.
+        assert_eq!(
+            resolve_file_url(None, Some("https://raw/url")).unwrap(),
+            "https://raw/url"
+        );
+        // Nothing at all: fail loudly, never an empty URL.
+        assert!(resolve_file_url(None, None).is_err());
+        assert!(resolve_file_url(None, Some("")).is_err());
+        assert!(resolve_file_url(
+            Some(&serde_json::json!({"fileUrl": ""})),
+            None,
+        )
+        .is_err());
     }
 }
