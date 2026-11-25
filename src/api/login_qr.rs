@@ -23,7 +23,7 @@ use url::Url;
 use crate::context::{ContextBase, ZaloCookie};
 use crate::errors::{Result, ZaloApiError, ZaloError};
 use crate::http;
-use crate::zlog_info;
+use crate::{zlog_error, zlog_info, zlog_warn};
 
 const QR_TIMEOUT_SECS: u64 = 100;
 const POLL_INTERVAL_SECS: u64 = 2;
@@ -137,21 +137,48 @@ pub struct LoginQrOptions {
 
 // --- Low-level HTTP steps ---
 
+/// Extract the login JS bundle version from the login page HTML.
+///
+/// The login page references both a CSS bundle (`main-<version>.css`) and
+/// the JS bundle (`main-<version>.js`) under `https://stc-zlogin.zdn.vn/`.
+/// Only the `.js` bundle's version is valid: every occurrence of the marker
+/// is scanned and the first one whose URL (up to the closing quote, query
+/// string stripped) ends with `.js` wins. Returns `None` when no JS bundle
+/// is found, so the caller reports a clear error instead of sending a
+/// garbage version to Zalo (which rejects it with "Truy cập không hợp lệ").
+fn extract_login_version(html: &str) -> Option<String> {
+    let marker = "https://stc-zlogin.zdn.vn/main-";
+    let mut search_from = 0;
+    while let Some(rel) = html[search_from..].find(marker) {
+        let start = search_from + rel + marker.len();
+        let rest = &html[start..];
+        let end = rest.find(|c| c == '"' || c == '\'').unwrap_or(rest.len());
+        let mut url_tail = &rest[..end];
+        if let Some(q) = url_tail.find(|c| c == '?' || c == '#') {
+            url_tail = &url_tail[..q];
+        }
+        if let Some(version) = url_tail.strip_suffix(".js") {
+            if !version.is_empty()
+                && version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            {
+                return Some(version.to_string());
+            }
+        }
+        search_from = start;
+    }
+    None
+}
+
 /// Discover the login page JS version.
 pub async fn load_login_page(ctx: &ContextBase) -> Result<String> {
     let url = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F";
     let res = http::get(ctx, url).await?;
     let html = res.text().await?;
-    let marker = "https://stc-zlogin.zdn.vn/main-";
-    if let Some(start) = html.find(marker) {
-        let rest = &html[start + marker.len()..];
-        if let Some(end) = rest.find(".js") {
-            return Ok(rest[..end].to_string());
-        }
-    }
-    Err(ZaloError::Api(ZaloApiError::new(
-        "Cannot get API login version",
-    )))
+    extract_login_version(&html).ok_or_else(|| {
+        ZaloError::Api(ZaloApiError::new("Cannot get API login version"))
+    })
 }
 
 async fn post_id_form(ctx: &ContextBase, url: &str, params: &[(&str, &str)]) -> Result<Value> {
@@ -190,7 +217,18 @@ pub async fn generate_qr(ctx: &ContextBase, version: &str) -> Result<QrGenerateR
         &[("continue", "https://zalo.me/pc"), ("v", version)],
     )
     .await?;
-    Ok(serde_json::from_value(data).unwrap_or_default())
+    let resp: QrGenerateResponse = serde_json::from_value(data.clone()).unwrap_or_default();
+    if resp.data.is_none() {
+        let raw: String = serde_json::to_string(&data).unwrap_or_default();
+        let raw: String = raw.chars().take(500).collect();
+        zlog_error!(
+            "generate_qr failed: error_code={} error_message={} raw={}",
+            resp.error_code,
+            resp.error_message,
+            raw
+        );
+    }
+    Ok(resp)
 }
 
 pub async fn waiting_scan(ctx: &ContextBase, version: &str, code: &str) -> Result<QrScanResponse> {
@@ -322,18 +360,22 @@ pub async fn login_qr(
     zlog_info!("Got login version: {}", version);
 
     // 2. Get login info (errors are logged but non-fatal, mirroring TS).
-    let _ = get_login_info(ctx, &version).await;
+    if let Err(e) = get_login_info(ctx, &version).await {
+        zlog_warn!("get_login_info failed (non-fatal): {}", e);
+    }
     emit(LoginQrEvent::GotLoginInfo);
 
     // 3. Verify client.
-    let _ = verify_client(ctx, &version).await;
+    if let Err(e) = verify_client(ctx, &version).await {
+        zlog_warn!("verify_client failed (non-fatal): {}", e);
+    }
 
     // 4. Generate QR.
     let qr = generate_qr(ctx, &version).await?;
     let qr_data = qr.data.ok_or_else(|| {
         ZaloError::Api(ZaloApiError::new(format!(
-            "Unable to generate QRCode: {}",
-            qr.error_message
+            "Unable to generate QRCode (error_code={}): {}",
+            qr.error_code, qr.error_message
         )))
     })?;
 
@@ -416,4 +458,41 @@ pub async fn login_qr(
         cookies,
         user_info: user_info_data.info,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_login_version;
+
+    #[test]
+    fn ignores_css_bundle_and_picks_js_version() {
+        let html = r#"<link href="https://stc-zlogin.zdn.vn/main-2606161423.css" rel="stylesheet"><script src="https://stc-zlogin.zdn.vn/main-2606161423.js"></script>"#;
+        assert_eq!(
+            extract_login_version(html).as_deref(),
+            Some("2606161423")
+        );
+    }
+
+    #[test]
+    fn returns_none_when_only_css_present() {
+        let html =
+            r#"<link href="https://stc-zlogin.zdn.vn/main-2606161423.css" rel="stylesheet">"#;
+        assert_eq!(extract_login_version(html), None);
+    }
+
+    #[test]
+    fn reproduces_reported_garbage_version_case() {
+        // Shape of the real login page from the user's Mac log: the old
+        // code returned `2606161423.css" rel="stylesheet">...` as the
+        // "version" because it scanned to the next ".js" far away in the HTML.
+        let html = concat!(
+            "<link href=\"https://stc-zlogin.zdn.vn/main-2606161423.css\" rel=\"stylesheet\">\n",
+            "<title>Đăng nhập tài khoản Zalo</title>\n",
+            "<script src=\"https://stc-zlogin.zdn.vn/main-2606161423.js\"></script>",
+        );
+        assert_eq!(
+            extract_login_version(html).as_deref(),
+            Some("2606161423")
+        );
+    }
 }
