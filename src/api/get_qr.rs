@@ -10,7 +10,8 @@ pub async fn get_qr(client: &ApiClient, user_id: &[String]) -> Result<GetQrRespo
     if user_id.is_empty() {
         return Err(ZaloError::Api(ZaloApiError::new("Missing user id")));
     }
-    let url = client.service_url("friend", "/api/friend/mget-qr")?;
+    let base_url = client.service_url("friend", "/api/friend/mget-qr")?;
+    let url = client.make_url(&base_url, &[], true)?;
     let params = serde_json::json!({ "fids": user_id });
     client.post_encrypted(&url, &params).await
 }

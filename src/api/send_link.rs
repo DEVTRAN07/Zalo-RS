@@ -1,5 +1,11 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+// Counter appended to the millisecond timestamp so `clientId` stays unique
+// even when several links are sent within the same millisecond.
+static CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use crate::api::client::ApiClient;
 use crate::api::parse_link;
@@ -26,8 +32,13 @@ pub async fn send_link(
     thread_id: &str,
     thread_type: ThreadType,
 ) -> Result<SendLinkResponse> {
-    let parsed = parse_link::parse_link(client, &options.link).await?;
-    let data = parsed.data;
+    let data = match parse_link::parse_link(client, &options.link).await {
+        Ok(parsed) => parsed.data,
+        Err(e) => {
+            log::warn!("send_link: parse_link failed for {}, sending without preview: {}", options.link, e);
+            Value::Null
+        }
+    };
 
     let msg = if let Some(m) = options.msg.as_ref().filter(|s| !s.trim().is_empty()) {
         if m.contains(&options.link) {
@@ -56,7 +67,7 @@ pub async fn send_link(
         "type": 2,
         "media": serde_json::to_string(&media).unwrap_or_else(|_| "null".to_string()),
         "ttl": options.ttl.unwrap_or(0),
-        "clientId": chrono::Utc::now().timestamp_millis(),
+        "clientId": chrono::Utc::now().timestamp_millis() * 1000 + (CLIENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed) % 1000) as i64,
     });
 
     let (path, base_svc) = match thread_type {
