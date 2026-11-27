@@ -128,6 +128,7 @@ impl Listener {
                     settings: ctx.settings.clone(),
                     extra_ver: ctx.extra_ver.clone(),
                     upload_callbacks: ctx.upload_callbacks.clone(),
+                    file_done_stash: ctx.file_done_stash.clone(),
                 };
                 let ws_query = vec![
                     ("t", now_ms().to_string()),
@@ -666,6 +667,12 @@ async fn handle_binary_message(
 /// Async upload completion callback (TS: listen.ts uploadCallbacks for
 /// file_done/send_file_done). Resolves the waiter registered by an upload so
 /// a sent file/voice does not stall until its timeout.
+///
+/// If no callback is registered for the file id yet, the event is stashed
+/// (see `FileDoneStash`) instead of dropped: single-chunk uploads register
+/// their callback only after their only chunk is POSTed, so the event can
+/// legitimately arrive first. The callback registered right after picks
+/// the stashed event up immediately.
 async fn dispatch_file_done_callback(ctx: &ContextSession, event_data: &Value) {
     if let Some(obj) = event_data.as_object() {
         if let Some(content) = obj.get("content").and_then(|v| v.as_object()) {
@@ -702,6 +709,17 @@ async fn dispatch_file_done_callback(ctx: &ContextSession, event_data: &Value) {
                         .remove(&file_id);
                     if let Some(cb) = callback {
                         cb(data).await;
+                    } else {
+                        // No callback registered yet (single-chunk upload:
+                        // the event can arrive before the only chunk's
+                        // response is processed). Stash it so the callback
+                        // registered right after picks it up instead of
+                        // waiting out the full 120s timeout.
+                        zlog_info!(
+                            "file_done for {} arrived before its callback was registered; stashing",
+                            file_id
+                        );
+                        ctx.file_done_stash.store(file_id, data);
                     }
                 }
             }
@@ -773,5 +791,80 @@ fn get_ping_interval_ms(ctx: &ContextSession) -> u64 {
         default
     } else {
         interval
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::{FileDoneStash, Options, UploadCallback};
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    fn dummy_ctx() -> ContextSession {
+        ContextSession {
+            api_type: 30,
+            api_version: 685,
+            imei: "test-imei".into(),
+            user_agent: "test-ua".into(),
+            language: "vi".into(),
+            secret_key: "test-key".into(),
+            uid: "1".into(),
+            options: Options::default(),
+            http: Arc::new(Mutex::new(None)),
+            login_info: Default::default(),
+            settings: None,
+            extra_ver: None,
+            upload_callbacks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            file_done_stash: FileDoneStash::new(),
+        }
+    }
+
+    fn file_done_event(file_id: &str, file_url: &str) -> Value {
+        serde_json::json!({
+            "content": {
+                "act": "send_file_done",
+                "act_type": "file_done",
+                "fileId": file_id,
+                "data": {"url": file_url, "fileUrl": file_url},
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn file_done_without_callback_is_stashed_not_dropped() {
+        let ctx = dummy_ctx();
+        // Event arrives before any callback exists (single-chunk upload).
+        dispatch_file_done_callback(&ctx, &file_done_event("fid-1", "https://cdn/x")).await;
+        // Stashed, not dropped.
+        let stashed = ctx.file_done_stash.take("fid-1");
+        assert!(stashed.is_some());
+        assert_eq!(stashed.unwrap()["fileUrl"], "https://cdn/x");
+        // Delivered at most once.
+        assert_eq!(ctx.file_done_stash.take("fid-1"), None);
+    }
+
+    #[tokio::test]
+    async fn file_done_with_callback_is_delivered_not_stashed() {
+        let ctx = dummy_ctx();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Value>();
+        let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+        let callback: UploadCallback = Arc::new(move |data| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                if let Some(sender) = tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = sender.send(data);
+                }
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        });
+        ctx.upload_callbacks
+            .lock()
+            .unwrap()
+            .insert("fid-2".to_string(), callback);
+        dispatch_file_done_callback(&ctx, &file_done_event("fid-2", "https://cdn/y")).await;
+        let got = rx.await.expect("callback should receive the event");
+        assert_eq!(got["fileUrl"], "https://cdn/y");
+        assert_eq!(ctx.file_done_stash.take("fid-2"), None);
     }
 }

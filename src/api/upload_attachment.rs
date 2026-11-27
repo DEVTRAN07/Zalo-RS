@@ -331,10 +331,12 @@ fn checksum_bytes(bytes: &[u8]) -> String {
 }
 
 /// Register the `file_done` WS callback for `file_id` and return the
-/// receiver the upload waits on. The WS dispatcher (`ws/mod.rs`) drops a
-/// `file_done` event whose `file_id` has no registered callback, so the
-/// callback must exist *before* the server can emit the event — i.e.
+/// receiver the upload waits on. The WS dispatcher (`ws/mod.rs`) stashes
+/// a `file_done` event whose `file_id` has no registered callback yet, so
+/// the callback must exist *before* the server can emit the event — i.e.
 /// before the final chunk is POSTed (see the chunk loop), not after.
+/// If the event already arrived and was stashed (single-chunk upload),
+/// it is delivered to the callback right away.
 fn register_upload_callback(client: &ApiClient, file_id: &str) -> oneshot::Receiver<Value> {
     let (tx, rx) = oneshot::channel::<Value>();
     let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
@@ -347,7 +349,17 @@ fn register_upload_callback(client: &ApiClient, file_id: &str) -> oneshot::Recei
         }) as Pin<Box<dyn Future<Output = ()> + Send>>
     });
     if let Ok(mut map) = client.ctx().upload_callbacks.lock() {
-        map.insert(file_id.to_string(), callback);
+        map.insert(file_id.to_string(), callback.clone());
+    }
+    // The server may already have emitted `file_done` before this
+    // callback existed (single-chunk upload); if the dispatcher stashed
+    // that event, deliver it to the callback right away instead of
+    // waiting out the 120s timeout.
+    if let Some(data) = client.ctx().file_done_stash.take(file_id) {
+        let cb = callback;
+        tokio::spawn(async move {
+            cb(data).await;
+        });
     }
     rx
 }
@@ -356,6 +368,7 @@ fn unregister_upload_callback(client: &ApiClient, file_id: &str) {
     if let Ok(mut map) = client.ctx().upload_callbacks.lock() {
         map.remove(file_id);
     }
+    client.ctx().file_done_stash.remove(file_id);
 }
 
 /// Pick the URL to send the message with. `file_done` data wins; the chunk
@@ -718,10 +731,8 @@ async fn upload_attachment_internal(
             // after the last chunk, then waited up to 120s for an event
             // that had already been dropped, and sent an empty URL).
             // Single-chunk uploads still register right after their only
-            // chunk; that residual window can only be closed by stashing
-            // early events in the WS dispatcher itself (follow-up outside
-            // this file), so a missing event now fails loudly below
-            // instead of producing an empty URL.
+            // chunk; if the event already arrived, the dispatcher stashed
+            // it and `register_upload_callback` delivers it immediately.
             if needs_file_done && upload_rx.is_none() {
                 if let Some(fid) = raw.file_id.clone().filter(|s| !s.is_empty()) {
                     upload_rx = Some(register_upload_callback(client, &fid));

@@ -115,6 +115,7 @@ impl ApiClient {
             settings: self.ctx.settings.clone(),
             extra_ver: self.ctx.extra_ver.clone(),
             upload_callbacks: self.ctx.upload_callbacks.clone(),
+            file_done_stash: self.ctx.file_done_stash.clone(),
         }
     }
 }
