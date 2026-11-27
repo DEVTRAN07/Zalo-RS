@@ -12,7 +12,7 @@ use base64::{
     Engine as _,
 };
 use chrono::{Datelike, Timelike};
-use flate2::read::ZlibDecoder;
+use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use generic_array::typenum::U16;
 use generic_array::GenericArray;
 use md5::{Digest, Md5};
@@ -69,6 +69,76 @@ pub fn decode_unit8_array(data: &[u8]) -> Option<String> {
 pub enum DecodedEventData {
     Object(Map<String, serde_json::Value>),
     Value(serde_json::Value),
+}
+
+/// Try decompressing `buf` as zlib; `None` when it is not valid zlib.
+fn try_zlib(buf: &[u8]) -> Option<Vec<u8>> {
+    let mut decoder = ZlibDecoder::new(buf);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+/// Try decompressing `buf` as gzip; `None` when it is not valid gzip.
+fn try_gzip(buf: &[u8]) -> Option<Vec<u8>> {
+    let mut decoder = GzDecoder::new(buf);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+/// Try decompressing `buf` as raw deflate (no zlib header); `None` when it
+/// is not valid raw deflate.
+fn try_raw_deflate(buf: &[u8]) -> Option<Vec<u8>> {
+    let mut decoder = DeflateDecoder::new(buf);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+/// Decompress a decrypted WS payload.
+///
+/// Zalo normally sends zlib, but live 521 (group message) / 621 frames
+/// sometimes arrive uncompressed (plain JSON), gzip, or raw deflate. The
+/// AES-GCM step already authenticated the bytes, so a zlib-only decoder
+/// drops those frames entirely ("Failed to decompress data: corrupt
+/// deflate stream") and the bot silently misses real group messages.
+/// Try zlib first (the documented format), then plain JSON, gzip, then
+/// raw deflate; only fail when none of them yields JSON.
+fn decompress_event_payload(decrypted: &[u8]) -> Result<Vec<u8>, ZaloApiError> {
+    if let Some(out) = try_zlib(decrypted) {
+        return Ok(out);
+    }
+    // Plain JSON straight from the server (no compression at all).
+    if serde_json::from_slice::<serde_json::Value>(decrypted).is_ok() {
+        return Ok(decrypted.to_vec());
+    }
+    if let Some(out) = try_gzip(decrypted) {
+        if serde_json::from_slice::<serde_json::Value>(&out).is_ok() {
+            return Ok(out);
+        }
+    }
+    if let Some(out) = try_raw_deflate(decrypted) {
+        if serde_json::from_slice::<serde_json::Value>(&out).is_ok() {
+            return Ok(out);
+        }
+    }
+    // Log the head of the authenticated plaintext so the next run shows
+    // exactly what format the server sent (never the full payload: it may
+    // hold message content).
+    let preview: String = decrypted
+        .iter()
+        .take(32)
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    crate::zlog_warn!(
+        "WS decode: payload is not zlib/plain-json/gzip/raw-deflate after AES-GCM (len={}, head_hex={})",
+        decrypted.len(),
+        preview
+    );
+    Err(ZaloApiError::new(
+        "Failed to decompress data: payload is not zlib, plain JSON, gzip or raw deflate",
+    ))
 }
 
 /// Decodes a websocket event payload, decrypting/decompressing it when needed.
@@ -173,12 +243,7 @@ pub async fn decode_event_data(
     let decompressed_buffer = if encrypt == 3 {
         decrypted_buffer
     } else {
-        let mut decoder = ZlibDecoder::new(&decrypted_buffer[..]);
-        let mut out = Vec::new();
-        decoder.read_to_end(&mut out).map_err(|e| {
-            ZaloApiError::new(format!("Failed to decompress data: {}", e))
-        })?;
-        out
+        decompress_event_payload(&decrypted_buffer)?
     };
 
     let decoded_data = String::from_utf8(decompressed_buffer).ok();
@@ -480,7 +545,7 @@ pub fn normalize_holder_name(input: Option<&str>) -> Option<String> {
 mod decode_event_data_tests {
     use super::*;
     use aes_gcm::aead::{Aead, Payload};
-    use flate2::write::ZlibEncoder;
+    use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
     use flate2::Compression;
     use std::io::Write;
 
@@ -489,13 +554,36 @@ mod decode_event_data_tests {
     /// (nonce[0..16] + aad[16..32] + ciphertext+tag) -> base64 ->
     /// URL-encoded (unless encrypt==1). Key may be 16/24/32 bytes.
     fn encrypt_ts_style(payload: &str, key_b64: &str, encrypt: i64) -> String {
+        encrypt_ts_style_mode(payload, key_b64, encrypt, "zlib")
+    }
+
+    /// Like `encrypt_ts_style`, but the pre-encryption transform is
+    /// selectable: `"zlib"` (default), `"plain"` (no compression — what
+    /// the server sends on some live 521/621 frames), `"gzip"`, or
+    /// `"deflate"` (raw deflate, no zlib header).
+    fn encrypt_ts_style_mode(payload: &str, key_b64: &str, encrypt: i64, mode: &str) -> String {
         let key_bytes = BASE64.decode(key_b64).unwrap();
         let plain: Vec<u8> = if encrypt == 3 {
             payload.as_bytes().to_vec()
         } else {
-            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-            enc.write_all(payload.as_bytes()).unwrap();
-            enc.finish().unwrap()
+            match mode {
+                "plain" => payload.as_bytes().to_vec(),
+                "gzip" => {
+                    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+                    enc.write_all(payload.as_bytes()).unwrap();
+                    enc.finish().unwrap()
+                }
+                "deflate" => {
+                    let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+                    enc.write_all(payload.as_bytes()).unwrap();
+                    enc.finish().unwrap()
+                }
+                _ => {
+                    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+                    enc.write_all(payload.as_bytes()).unwrap();
+                    enc.finish().unwrap()
+                }
+            }
         };
         let mut wire: Vec<u8> = Vec::new();
         let nonce: [u8; 16] = [7u8; 16];
@@ -644,5 +732,53 @@ mod decode_event_data_tests {
         let data = encrypt_ts_style(GROUP_PAYLOAD, &BASE64.encode([1u8; 16]), 2);
         let out = decode_event_data(&frame(&data, 2), Some(&key_b64)).await;
         assert!(out.is_err(), "20-byte key must fail, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn encrypt2_plain_json_fallback_decodes_group_frame() {
+        // Live 521 frames sometimes arrive uncompressed: AES-GCM is fine,
+        // zlib fails ("corrupt deflate stream") — the plaintext JSON must
+        // still decode instead of dropping a real group message.
+        let key_b64 = BASE64.encode([6u8; 16]);
+        let data = encrypt_ts_style_mode(GROUP_PAYLOAD, &key_b64, 2, "plain");
+        let v = decoded_value(decode_event_data(&frame(&data, 2), Some(&key_b64)).await);
+        assert_eq!(v["groupMsgs"][0]["content"], "/bot on");
+    }
+
+    #[tokio::test]
+    async fn encrypt2_gzip_fallback_decodes_group_frame() {
+        let key_b64 = BASE64.encode([7u8; 16]);
+        let data = encrypt_ts_style_mode(GROUP_PAYLOAD, &key_b64, 2, "gzip");
+        let v = decoded_value(decode_event_data(&frame(&data, 2), Some(&key_b64)).await);
+        assert_eq!(v["groupMsgs"][0]["content"], "/bot on");
+    }
+
+    #[tokio::test]
+    async fn encrypt2_raw_deflate_fallback_decodes_group_frame() {
+        let key_b64 = BASE64.encode([8u8; 16]);
+        let data = encrypt_ts_style_mode(GROUP_PAYLOAD, &key_b64, 2, "deflate");
+        let v = decoded_value(decode_event_data(&frame(&data, 2), Some(&key_b64)).await);
+        assert_eq!(v["groupMsgs"][0]["content"], "/bot on");
+    }
+
+    #[tokio::test]
+    async fn encrypt1_plain_json_fallback_decodes_group_frame() {
+        // encrypt==1 (base64, no AES) with an uncompressed payload.
+        let data = BASE64.encode(GROUP_PAYLOAD);
+        let v = decoded_value(decode_event_data(&frame(&data, 1), None).await);
+        assert_eq!(v["groupMsgs"][0]["content"], "/bot on");
+    }
+
+    #[tokio::test]
+    async fn encrypt2_garbage_payload_still_errors() {
+        // Authenticated but neither zlib, JSON, gzip nor raw deflate:
+        // must still fail (with the decompress error), not silently
+        // return garbage.
+        let key_b64 = BASE64.encode([9u8; 16]);
+        let data = encrypt_ts_style_mode("not json {{{ garbage", &key_b64, 2, "plain");
+        let out = decode_event_data(&frame(&data, 2), Some(&key_b64)).await;
+        assert!(out.is_err(), "garbage payload must fail, got {out:?}");
+        let msg = format!("{:?}", out.unwrap_err());
+        assert!(msg.contains("decompress"), "error must mention decompress, got {msg}");
     }
 }
