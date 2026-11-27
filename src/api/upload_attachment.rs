@@ -32,6 +32,16 @@ pub enum AttachmentSource {
 #[serde(rename_all = "camelCase")]
 pub struct UploadAttachmentImageResponse {
     pub normal_url: String,
+    /// URL ảnh GỐC do server trả về (`oriUrl` trong response của
+    /// `photo_original/upload`, fallback `fileUrl` khi chunk response
+    /// tự mang URL trực tiếp). Rỗng khi server không trả — caller dùng
+    /// [`UploadAttachmentImageResponse::original_url`] để fallback về
+    /// `normal_url`, nên hành vi cũ giữ nguyên khi không có URL gốc.
+    /// Thêm field này để ảnh gửi đi giữ dạng gốc thay vì bị flatten
+    /// về bản Thường (trước đây `send_uploaded_attachments` gán
+    /// `oriUrl`/`rawUrl` = `normal_url`).
+    #[serde(default)]
+    pub ori_url: String,
     pub photo_id: String,
     pub finished: Value,
     pub hd_url: String,
@@ -43,6 +53,21 @@ pub struct UploadAttachmentImageResponse {
     pub height: u64,
     pub total_size: u64,
     pub hd_size: u64,
+}
+
+impl UploadAttachmentImageResponse {
+    /// URL ảnh gửi đi: bản GỐC (`ori_url`) khi server trả về, nếu
+    /// không thì bản Thường (`normal_url`). Đây là điểm duy nhất quyết
+    /// định chất lượng ảnh gửi — mọi đường gửi ảnh (nhóm + riêng) đều
+    /// đi qua đây, nên ảnh bot gửi luôn là bản gốc khi có.
+    pub fn original_url(&self) -> &str {
+        let ori = self.ori_url.trim();
+        if ori.is_empty() {
+            self.normal_url.as_str()
+        } else {
+            ori
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -93,6 +118,10 @@ struct RawUploadResponse {
     normal_url: Option<String>,
     hd_url: Option<String>,
     thumb_url: Option<String>,
+    /// URL ảnh gốc (`oriUrl`) nếu server trả về trong response upload.
+    /// Không phải lúc nào cũng có — thiếu thì đường gửi fallback về
+    /// `normal_url` qua `UploadAttachmentImageResponse::original_url`.
+    ori_url: Option<String>,
     /// Direct file URL if the chunk response itself carries one
     /// (`fileUrl`/`file_url`). Used as a fallback when the `file_done`
     /// WS event never arrives, so the upload does not end with an empty URL.
@@ -137,6 +166,11 @@ impl RawUploadResponse {
                 .map(ToString::to_string),
             thumb_url: value
                 .get("thumbUrl")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            ori_url: value
+                .get("oriUrl")
+                .or_else(|| value.get("ori_url"))
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string),
             file_url: value
@@ -761,6 +795,13 @@ async fn upload_attachment_internal(
             FileKind::Image => {
                 results.push(UploadAttachmentType::Image(UploadAttachmentImageResponse {
                     normal_url: raw.normal_url.unwrap_or_default(),
+                    // Giữ URL gốc: ưu tiên oriUrl server trả về, rồi
+                    // fileUrl trực tiếp từ chunk response, cuối cùng rỗng
+                    // (đường gửi sẽ fallback về normal_url).
+                    ori_url: raw
+                        .ori_url
+                        .or(raw.file_url)
+                        .unwrap_or_default(),
                     photo_id: raw.photo_id.unwrap_or_default(),
                     finished: raw.finished,
                     hd_url: raw.hd_url.clone().unwrap_or_default(),
@@ -850,6 +891,51 @@ async fn upload_attachment_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_url_uu_tien_ori_url_roi_moi_fallback_normal_url() {
+        // Có oriUrl (gốc) -> gửi bản gốc, không gửi bản Thường.
+        let with_ori = UploadAttachmentImageResponse {
+            normal_url: "https://cdn/n.jpg".to_string(),
+            ori_url: "https://cdn/o.jpg".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(with_ori.original_url(), "https://cdn/o.jpg");
+        // Không có oriUrl -> fallback bản Thường (hành vi cũ giữ nguyên).
+        let without_ori = UploadAttachmentImageResponse {
+            normal_url: "https://cdn/n.jpg".to_string(),
+            ori_url: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(without_ori.original_url(), "https://cdn/n.jpg");
+        // oriUrl toàn khoảng trắng cũng coi như không có.
+        let blank_ori = UploadAttachmentImageResponse {
+            normal_url: "https://cdn/n.jpg".to_string(),
+            ori_url: "   ".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(blank_ori.original_url(), "https://cdn/n.jpg");
+    }
+
+    #[test]
+    fn raw_upload_response_doc_ori_url_tu_chunk_response() {
+        let raw = RawUploadResponse::from_value(serde_json::json!({
+            "normalUrl": "https://cdn/n.jpg",
+            "hdUrl": "https://cdn/h.jpg",
+            "thumbUrl": "https://cdn/t.jpg",
+            "oriUrl": "https://cdn/o.jpg",
+            "fileUrl": "https://cdn/f.jpg",
+            "photoId": "123"
+        }));
+        assert_eq!(raw.ori_url.as_deref(), Some("https://cdn/o.jpg"));
+        assert_eq!(raw.normal_url.as_deref(), Some("https://cdn/n.jpg"));
+        // Không có oriUrl -> None (đường gửi fallback về normal_url).
+        let raw2 = RawUploadResponse::from_value(serde_json::json!({
+            "normalUrl": "https://cdn/n.jpg",
+            "photoId": "123"
+        }));
+        assert!(raw2.ori_url.is_none());
+    }
 
     #[test]
     fn classify_gif_is_image_and_mov_webm_are_video() {

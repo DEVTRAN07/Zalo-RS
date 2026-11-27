@@ -392,13 +392,21 @@ async fn send_uploaded_attachments(
         let client_id = next_client_id();
         let (path, mut params) = match att {
             UploadAttachmentType::Image(img) => {
+                // ORIGINAL: mọi URL ảnh gửi đi lấy bản gốc
+                // (`UploadAttachmentImageResponse::original_url` = oriUrl
+                // server trả về, fallback normalUrl khi không có).
+                // Trước đây cả 3 field đều gán normal_url (bản Thường
+                // đã nén) nên ảnh gửi đi bị flatten về bản Thường.
+                // hdUrl/thumbUrl giữ nguyên: chỉ là bản xem trước/HD
+                // kèm theo, không phải ảnh chính người nhận mở.
+                let original_url = img.original_url();
                 let mut p = serde_json::json!({
                     "photoId": img.photo_id,
                     "clientId": client_id.to_string(),
                     "desc": desc,
                     "width": img.width,
                     "height": img.height,
-                    "rawUrl": img.normal_url,
+                    "rawUrl": original_url,
                     "hdUrl": img.hd_url,
                     "thumbUrl": img.thumb_url,
                     "hdSize": img.total_size.to_string(),
@@ -418,10 +426,10 @@ async fn send_uploaded_attachments(
                 }
                 if is_group {
                     p["grid"] = Value::String(thread_id.to_string());
-                    p["oriUrl"] = Value::String(img.normal_url.clone());
+                    p["oriUrl"] = Value::String(original_url.to_string());
                 } else {
                     p["toid"] = Value::String(thread_id.to_string());
-                    p["normalUrl"] = Value::String(img.normal_url.clone());
+                    p["normalUrl"] = Value::String(original_url.to_string());
                 }
                 if is_multi {
                     p["groupLayoutId"] = Value::from(group_layout_id);
