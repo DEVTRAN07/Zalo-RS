@@ -47,6 +47,11 @@ pub enum Urgency {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageResponse {
     pub msg_id: i64,
+    /// clientId đã gửi kèm request — cần cho `undo` (thu hồi) và
+    /// `addReaction`. Trước đây upstream tự sinh nhưng không trả ra,
+    /// nên bot không bao giờ hẹn thu hồi được.
+    #[serde(default)]
+    pub cli_msg_id: i64,
 }
 
 /// Options for [`send_message_options`], mirroring the TypeScript `MessageContent`.
@@ -156,7 +161,7 @@ pub async fn send_message(
 
     let response = client.post_encrypted(&url, &params).await?;
     let msg_id = extract_msg_id(response)?;
-    Ok(SendMessageResponse { msg_id })
+    Ok(SendMessageResponse { msg_id, cli_msg_id: client_id })
 }
 
 /// Send a message with optional mentions, quotes, attachments, text styles,
@@ -309,7 +314,7 @@ pub async fn send_message_options(
             thread_type,
         )
         .await?;
-        let msg_id = send_uploaded_attachments(
+        let (msg_id, cli_msg_id) = send_uploaded_attachments(
             client,
             &uploaded,
             &thread_id,
@@ -321,12 +326,14 @@ pub async fn send_message_options(
             attachment_meta.as_ref(),
         )
         .await?;
-        return Ok(SendMessageResponse { msg_id });
+        // `send_uploaded_attachments` trả (msg_id, cli_msg_id) của
+        // attachment cuối — đó là id của tin đã gửi.
+        return Ok(SendMessageResponse { msg_id, cli_msg_id });
     }
 
     let response = client.post_encrypted(&url, &params).await?;
     let msg_id = extract_msg_id(response)?;
-    Ok(SendMessageResponse { msg_id })
+    Ok(SendMessageResponse { msg_id, cli_msg_id: client_id })
 }
 
 /// File extension (lowercase, without the dot) of an attachment source.
@@ -372,7 +379,7 @@ async fn send_uploaded_attachments(
     can_be_desc: bool,
     ttl: Option<i64>,
     meta_data: Option<&Value>,
-) -> Result<i64> {
+) -> Result<(i64, i64)> {
     if uploaded.is_empty() {
         return Err(ZaloError::Api(ZaloApiError::new(
             "No attachments to send",
@@ -385,11 +392,22 @@ async fn send_uploaded_attachments(
     // TypeScript counts down from `uploadAttachment.length - 1`.
     let mut index_in_group = uploaded.len() as i64 - 1;
     let mut last_msg_id: Option<i64> = None;
+    // cli_msg_id của attachment cuối — chính là id dùng để thu hồi
+    // tin đã gửi: ảnh dùng `client_id` sinh mới ở mỗi vòng lặp
+    // (`"clientId": client_id.to_string()`); video/file dùng
+    // `client_file_id` từ response upload (`"clientId": client_file_id`).
+    let mut last_cli_msg_id: i64 = 0;
 
     for att in uploaded {
         // Fresh unique id per attachment (never a bare timestamp: two
         // attachments sent in the same millisecond must not share one).
         let client_id = next_client_id();
+        // clientId thực tế gửi kèm attachment này.
+        let sent_cli_id = match att {
+            UploadAttachmentType::Image(_) => client_id,
+            UploadAttachmentType::Video(v) => v.client_file_id,
+            UploadAttachmentType::File(f) => f.client_file_id,
+        };
         let (path, mut params) = match att {
             UploadAttachmentType::Image(img) => {
                 // ORIGINAL: mọi URL ảnh gửi đi lấy bản gốc
@@ -519,11 +537,15 @@ async fn send_uploaded_attachments(
         let url = client.make_url(&base_url, &[("nretry", "0".to_string())], true)?;
         let response: Value = client.post_encrypted(&url, &params).await?;
         last_msg_id = Some(extract_msg_id(response)?);
+        last_cli_msg_id = sent_cli_id;
     }
 
-    last_msg_id.ok_or_else(|| {
-        ZaloError::Api(ZaloApiError::new("No attachment was sent successfully"))
-    })
+    match last_msg_id {
+        Some(msg_id) => Ok((msg_id, last_cli_msg_id)),
+        None => Err(ZaloError::Api(ZaloApiError::new(
+            "No attachment was sent successfully",
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -588,5 +610,22 @@ mod tests {
         assert!(!can_carry_text_as_desc(&[img.clone(), img2]));
         assert!(!can_carry_text_as_desc(std::slice::from_ref(&vid)));
         assert!(!can_carry_text_as_desc(&[]));
+    }
+
+    #[test]
+    fn send_message_response_cli_msg_id_mac_dinh_0() {
+        // JSON cũ không có cli_msg_id vẫn parse được (serde default).
+        let r: SendMessageResponse = serde_json::from_str(r#"{"msg_id": 123}"#).unwrap();
+        assert_eq!(r.msg_id, 123);
+        assert_eq!(r.cli_msg_id, 0);
+    }
+
+    #[test]
+    fn send_message_response_cli_msg_id_round_trip() {
+        let r = SendMessageResponse { msg_id: 123, cli_msg_id: 456 };
+        let back: SendMessageResponse =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.msg_id, 123);
+        assert_eq!(back.cli_msg_id, 456);
     }
 }
