@@ -674,55 +674,82 @@ async fn handle_binary_message(
 /// legitimately arrive first. The callback registered right after picks
 /// the stashed event up immediately.
 async fn dispatch_file_done_callback(ctx: &ContextSession, event_data: &Value) {
-    if let Some(obj) = event_data.as_object() {
-        if let Some(content) = obj.get("content").and_then(|v| v.as_object()) {
-            let act = content.get("act").and_then(|v| v.as_str()).unwrap_or("");
-            let act_type = content
-                .get("act_type")
-                .or_else(|| content.get("actType"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if act_type == "file_done" && (act == "send_file_done" || act == "file_done") {
-                if let Some(file_id) = content
-                    .get("fileId")
-                    .or_else(|| content.get("file_id"))
-                    .and_then(|v| {
-                        v.as_str()
-                            .map(|s| s.to_string())
-                            .or_else(|| v.as_i64().map(|n| n.to_string()))
-                    })
-                {
-                    let file_url = content
-                        .get("data")
-                        .and_then(|d| d.get("url").or_else(|| d.get("fileUrl")))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let data = serde_json::json!({
-                        "fileUrl": file_url,
-                        "fileId": file_id.clone(),
-                    });
-                    let callback = ctx
-                        .upload_callbacks
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&file_id);
-                    if let Some(cb) = callback {
-                        cb(data).await;
-                    } else {
-                        // No callback registered yet (single-chunk upload:
-                        // the event can arrive before the only chunk's
-                        // response is processed). Stash it so the callback
-                        // registered right after picks it up instead of
-                        // waiting out the full 120s timeout.
-                        zlog_info!(
-                            "file_done for {} arrived before its callback was registered; stashing",
-                            file_id
-                        );
-                        ctx.file_done_stash.store(file_id, data);
-                    }
-                }
-            }
+    // Frame thật của (601,0) sau giải mã có dạng envelope:
+    //   {"data": {"controls": [...]}}   (encrypt > 0)
+    //   {"controls": [...]}              (encrypt == 0)
+    // JS gốc (`listen.js` cmd 601) bóc `.data` rồi lặp mảng `controls`,
+    // chỉ kiểm tra `content.act_type == "file_done"` (KHÔNG kiểm tra `act`).
+    // Bản cũ đọc thẳng `event_data.content` nên `.get("content")` luôn là
+    // None → callback không bao giờ chạy, upload File/Other (voice .aac,
+    // video, file) chờ đủ 120s rồi lỗi.
+    let inner = event_data.get("data").unwrap_or(event_data);
+    let mut controls: Vec<&Value> = Vec::new();
+    if let Some(arr) = inner.get("controls").and_then(|v| v.as_array()) {
+        controls.extend(arr.iter());
+    }
+    // Robustness: chấp nhận cả control trần {"content": {...}} (shape test cũ).
+    if controls.is_empty() && inner.get("content").is_some() {
+        controls.push(inner);
+    }
+    for control in controls {
+        let Some(content) = control.get("content").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        let act_type = content
+            .get("act_type")
+            .or_else(|| content.get("actType"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Khớp JS: chỉ kiểm tra act_type, KHÔNG kiểm tra `act`.
+        if act_type != "file_done" {
+            continue;
+        }
+        let Some(file_id) = content
+            .get("fileId")
+            .or_else(|| content.get("file_id"))
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
+        else {
+            continue;
+        };
+        let file_url = content
+            .get("data")
+            .and_then(|d| d.get("url").or_else(|| d.get("fileUrl")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let data = serde_json::json!({
+            "fileUrl": file_url,
+            "fileId": file_id.clone(),
+        });
+        let callback = ctx
+            .upload_callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&file_id);
+        if let Some(cb) = callback {
+            // Log warn (chỉ fileId, KHÔNG log giá trị URL) để log live
+            // chứng minh được event đã về và giao cho waiter.
+            zlog_warn!(
+                "file_done for {}: giao callback (url_rong={})",
+                file_id,
+                file_url.is_empty()
+            );
+            cb(data).await;
+        } else {
+            // No callback registered yet (single-chunk upload:
+            // the event can arrive before the only chunk's
+            // response is processed). Stash it so the callback
+            // registered right after picks it up instead of
+            // waiting out the full 120s timeout.
+            zlog_warn!(
+                "file_done for {} arrived before its callback was registered; stashing",
+                file_id
+            );
+            ctx.file_done_stash.store(file_id, data);
         }
     }
 }
@@ -822,6 +849,31 @@ mod tests {
     }
 
     fn file_done_event(file_id: &str, file_url: &str) -> Value {
+        // Shape THẬT trên dây (encrypt > 0): envelope `data` + mảng `controls`.
+        serde_json::json!({
+            "data": {"controls": [{"content": {
+                "act": "send_file_done",
+                "act_type": "file_done",
+                "fileId": file_id,
+                "data": {"url": file_url, "fileUrl": file_url},
+            }}]}
+        })
+    }
+
+    fn file_done_event_unencrypted(file_id: &str, file_url: &str) -> Value {
+        // Biến thể encrypt == 0: không có envelope `data`.
+        serde_json::json!({
+            "controls": [{"content": {
+                "act": "send_file_done",
+                "act_type": "file_done",
+                "fileId": file_id,
+                "data": {"url": file_url, "fileUrl": file_url},
+            }}]
+        })
+    }
+
+    fn file_done_event_bare(file_id: &str, file_url: &str) -> Value {
+        // Control trần (robustness; shape test cũ).
         serde_json::json!({
             "content": {
                 "act": "send_file_done",
@@ -866,5 +918,70 @@ mod tests {
         let got = rx.await.expect("callback should receive the event");
         assert_eq!(got["fileUrl"], "https://cdn/y");
         assert_eq!(ctx.file_done_stash.take("fid-2"), None);
+    }
+
+    #[tokio::test]
+    async fn file_done_unencrypted_shape_is_stashed() {
+        // Biến thể encrypt == 0: {"controls": [...]} không có envelope `data`.
+        let ctx = dummy_ctx();
+        dispatch_file_done_callback(&ctx, &file_done_event_unencrypted("fid-3", "https://cdn/z"))
+            .await;
+        let stashed = ctx.file_done_stash.take("fid-3");
+        assert!(stashed.is_some());
+        assert_eq!(stashed.unwrap()["fileUrl"], "https://cdn/z");
+    }
+
+    #[tokio::test]
+    async fn file_done_bare_control_is_stashed() {
+        // Control trần {"content": {...}} vẫn được chấp nhận (robustness).
+        let ctx = dummy_ctx();
+        dispatch_file_done_callback(&ctx, &file_done_event_bare("fid-4", "https://cdn/w")).await;
+        let stashed = ctx.file_done_stash.take("fid-4");
+        assert!(stashed.is_some());
+        assert_eq!(stashed.unwrap()["fileUrl"], "https://cdn/w");
+    }
+
+    #[tokio::test]
+    async fn file_done_ignores_non_file_done_controls() {
+        // Control khác act_type trong cùng mảng `controls` phải bị bỏ qua.
+        let ctx = dummy_ctx();
+        let event = serde_json::json!({
+            "data": {"controls": [
+                {"content": {
+                    "act": "send_file_uploading",
+                    "act_type": "file_uploading",
+                    "fileId": "fid-5",
+                    "data": {"url": "https://cdn/nope"},
+                }},
+                {"content": {
+                    "act": "send_file_done",
+                    "act_type": "file_done",
+                    "fileId": "fid-6",
+                    "data": {"url": "https://cdn/ok"},
+                }},
+            ]}
+        });
+        dispatch_file_done_callback(&ctx, &event).await;
+        assert_eq!(ctx.file_done_stash.take("fid-5"), None);
+        let stashed = ctx.file_done_stash.take("fid-6");
+        assert!(stashed.is_some());
+        assert_eq!(stashed.unwrap()["fileUrl"], "https://cdn/ok");
+    }
+
+    #[tokio::test]
+    async fn file_done_without_act_field_is_accepted_like_js() {
+        // JS gốc không kiểm tra `act`: control thiếu `act` vẫn phải chạy.
+        let ctx = dummy_ctx();
+        let event = serde_json::json!({
+            "data": {"controls": [{"content": {
+                "act_type": "file_done",
+                "fileId": "fid-7",
+                "data": {"url": "https://cdn/no-act"},
+            }}]}
+        });
+        dispatch_file_done_callback(&ctx, &event).await;
+        let stashed = ctx.file_done_stash.take("fid-7");
+        assert!(stashed.is_some());
+        assert_eq!(stashed.unwrap()["fileUrl"], "https://cdn/no-act");
     }
 }

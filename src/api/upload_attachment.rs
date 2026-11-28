@@ -852,6 +852,16 @@ async fn upload_attachment_internal(
             }
             FileKind::Video | FileKind::Other => {
                 let file_id = raw.file_id.clone().unwrap_or_default();
+                // LOG CHẨN ĐOÁN (như nhánh Image): tên key chunk response
+                // cuối + fileUrl có về không. Chỉ log TÊN key, không log
+                // giá trị URL. Mức warn để chắc chắn hiện trong log live.
+                log::warn!(
+                    "[upload-diag] chunk cuoi upload file: kind={} keys={:?} fileUrl={} fileId_rong={}",
+                    if matches!(kind, FileKind::Video) { "video" } else { "other" },
+                    raw.data_keys,
+                    raw.file_url.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+                    file_id.is_empty(),
+                );
                 // If the file id only appeared in the last chunk response
                 // (e.g. a single-chunk upload), register now, immediately
                 // after the upload — the early-registration path above
