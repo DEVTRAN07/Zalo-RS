@@ -1,3 +1,4 @@
+use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
@@ -215,7 +216,7 @@ impl FileKind {
     }
 }
 
-fn sharefile_setting_u64(settings: &Option<Value>, key: &str, default: u64) -> u64 {
+pub(crate) fn sharefile_setting_u64(settings: &Option<Value>, key: &str, default: u64) -> u64 {
     settings
         .as_ref()
         .and_then(|s| s.get("features").or_else(|| s.get("sharefile")))
@@ -268,7 +269,18 @@ fn classify_extension(ext: &str) -> FileKind {
     }
 }
 
-fn image_dimensions(data: &[u8]) -> Option<(u64, u64)> {
+pub(crate) fn image_dimensions(data: &[u8]) -> Option<(u64, u64)> {
+    // GIF: "GIF87a"/"GIF89a" + width/height LE u16 ở byte 6..10.
+    // (Trước đây GIF không đọc được kích thước nên `send_gif` không có
+    // width/height thật để gửi kèm.)
+    if data.len() >= 10 && (data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a")) {
+        let width = u16::from_le_bytes([data[6], data[7]]) as u64;
+        let height = u16::from_le_bytes([data[8], data[9]]) as u64;
+        if width > 0 && height > 0 {
+            return Some((width, height));
+        }
+    }
+
     if data.starts_with(b"\x89PNG\r\n\x1a\n") && data.len() >= 24 && &data[12..16] == b"IHDR" {
         let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]) as u64;
         let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]) as u64;
@@ -345,7 +357,7 @@ fn image_dimensions(data: &[u8]) -> Option<(u64, u64)> {
     None
 }
 
-async fn file_bytes_and_name(source: AttachmentSource) -> Result<(Vec<u8>, String)> {
+pub(crate) async fn file_bytes_and_name(source: AttachmentSource) -> Result<(Vec<u8>, String)> {
     match source {
         AttachmentSource::Path(path) => {
             let data = fs::read(&path).await.map_err(|e| {
@@ -374,7 +386,7 @@ async fn file_bytes_and_name(source: AttachmentSource) -> Result<(Vec<u8>, Strin
 /// (Note: `core::utils::get_md5_large_file_object` streams from disk but
 /// takes the *other* `AttachmentSource` type (`models::attachment`, with an
 /// `InMemory` variant), so it cannot be reused for this enum directly.)
-fn checksum_bytes(bytes: &[u8]) -> String {
+pub(crate) fn checksum_bytes(bytes: &[u8]) -> String {
     use md5::{Digest, Md5};
     let mut hasher = Md5::new();
     hasher.update(bytes);
@@ -610,6 +622,31 @@ async fn post_chunk(
     }))
 }
 
+/// Số chunk tối đa cùng bay khi upload song song. JS gốc (`uploadAttachment`)
+/// bắn TẤT CẢ chunk cùng lúc (`Promise.all`); ta giới hạn 4 để không dội
+/// server/proxy khi file lớn (100MB = 100 chunk). File 5MB (6 chunk) vẫn
+/// nhanh gấp ~3 lần bản nối tiếp cũ (2 lượt thay vì 6 lượt).
+const MAX_CHUNKS_IN_FLIGHT: usize = 4;
+
+/// Chọn response dùng làm kết quả upload từ các chunk response (về theo
+/// thứ tự hoàn thành, không theo chunkId): response của chunk CUỐI
+/// (chunkId == total_chunk) mới mang URL đầy đủ (finished=true); các chunk
+/// giữa chỉ mang fileId/photoId. Thiếu chunk cuối (không nên xảy ra) thì
+/// fallback response về sau cùng.
+fn pick_final_raw(
+    collected: Vec<(i64, RawUploadResponse)>,
+    total_chunk: usize,
+) -> Option<RawUploadResponse> {
+    let mut fallback: Option<RawUploadResponse> = None;
+    for (chunk_id, raw) in collected {
+        if chunk_id as usize == total_chunk {
+            return Some(raw);
+        }
+        fallback = Some(raw);
+    }
+    fallback
+}
+
 pub async fn upload_attachment(
     client: &ApiClient,
     sources: Vec<AttachmentSource>,
@@ -738,31 +775,55 @@ async fn upload_attachment_internal(
             kind.url_type()
         );
 
-        let mut last_raw: Option<RawUploadResponse> = None;
         // Receiver for the `file_done` WS event, registered as soon as the
         // server first returns a file id. Images never wait for `file_done`,
         // so only file/video uploads register.
         let needs_file_done = matches!(kind, FileKind::Video | FileKind::Other);
         let mut upload_rx: Option<oneshot::Receiver<Value>> = None;
         let mut upload_file_id: Option<String> = None;
+        // Chuẩn bị TẤT CẢ chunk request TRƯỚC khi bay (mã hóa params + URL
+        // từng chunk). Lỗi ở đây thì chưa POST chunk nào — khác bản nối
+        // tiếp cũ vốn dừng giữa chừng khi gặp lỗi ở chunk sau.
+        let mut chunk_jobs: Vec<(i64, String, Vec<u8>)> = Vec::with_capacity(total_chunk);
         for (idx, chunk) in bytes.chunks(chunk_size).enumerate() {
-            params.insert("chunkId".to_string(), Value::from((idx + 1) as i64));
-            let params_value = Value::Object(params.clone());
-            let encrypted = client
-                .encode_aes(&params_value.to_string())
-                .ok_or_else(|| ZaloError::Api(ZaloApiError::new("Failed to encrypt message")))?;
-
+            let chunk_id = (idx + 1) as i64;
+            let mut p = params.clone();
+            p.insert("chunkId".to_string(), Value::from(chunk_id));
+            let encrypted = client.encode_aes(&Value::Object(p).to_string()).ok_or_else(|| {
+                ZaloError::Api(ZaloApiError::new("Failed to encrypt message"))
+            })?;
             // `make_url` appends the `zpw_ver` / `zpw_type` markers the Zalo
             // web API expects on every request (and URL-encodes the values).
             let request_url = client.make_url(
                 &url_path,
-                &[
-                    ("type", type_param.to_string()),
-                    ("params", encrypted.clone()),
-                ],
+                &[("type", type_param.to_string()), ("params", encrypted)],
                 true,
             )?;
-            let raw = match post_chunk(client, &request_url, chunk.to_vec(), &file_name).await {
+            chunk_jobs.push((chunk_id, request_url, chunk.to_vec()));
+        }
+
+        // Upload các chunk SONG SONG (JS gốc: `Promise.all`, xem
+        // `uploadAttachment.js:196`), tối đa `MAX_CHUNKS_IN_FLIGHT` chunk
+        // cùng bay. Bản nối tiếp cũ khiến voice 5.4MB (6 chunk) mất 6 lần
+        // thời gian 1 chunk (live: 3–12s/chunk → 18–72s).
+        // Race fix: server chỉ phát `file_done` khi đủ chunk, và dispatcher
+        // stash event chưa có callback — nên đăng ký callback ngay khi
+        // chunk ĐẦU TIÊN về (bất kể chunk nào) là đủ; đăng ký muộn vẫn
+        // được stash cứu (xem `register_upload_callback`).
+        let mut stream = futures_util::stream::iter(chunk_jobs.into_iter().map(
+            |(chunk_id, request_url, chunk_bytes)| {
+                let file_name = file_name.clone();
+                async move {
+                    let raw = post_chunk(client, &request_url, chunk_bytes, &file_name).await;
+                    (chunk_id, raw)
+                }
+            },
+        ))
+        .buffer_unordered(MAX_CHUNKS_IN_FLIGHT);
+        // Response các chunk về theo thứ tự hoàn thành (không theo chunkId).
+        let mut collected: Vec<(i64, RawUploadResponse)> = Vec::with_capacity(total_chunk);
+        while let Some((chunk_id, res)) = stream.next().await {
+            let raw = match res {
                 Ok(raw) => raw,
                 Err(e) => {
                     // Do not leak a callback registered for an upload that
@@ -773,28 +834,19 @@ async fn upload_attachment_internal(
                     return Err(e);
                 }
             };
-            // Race fix: the server emits `file_done` as soon as the final
-            // chunk lands, and the WS dispatcher drops the event if no
-            // callback is registered for that file id yet. The file id is
-            // normally already present in the first chunk response, so
-            // register here — before the final chunk is POSTed — instead
-            // of only after the whole upload (the old code registered
-            // after the last chunk, then waited up to 120s for an event
-            // that had already been dropped, and sent an empty URL).
-            // Single-chunk uploads still register right after their only
-            // chunk; if the event already arrived, the dispatcher stashed
-            // it and `register_upload_callback` delivers it immediately.
             if needs_file_done && upload_rx.is_none() {
                 if let Some(fid) = raw.file_id.clone().filter(|s| !s.is_empty()) {
                     upload_rx = Some(register_upload_callback(client, &fid));
                     upload_file_id = Some(fid);
                 }
             }
-            last_raw = Some(raw);
+            collected.push((chunk_id, raw));
         }
+        drop(stream);
 
-        let raw =
-            last_raw.ok_or_else(|| ZaloError::Api(ZaloApiError::new("Empty upload response")))?;
+        let raw = pick_final_raw(collected, total_chunk).ok_or_else(|| {
+            ZaloError::Api(ZaloApiError::new("Empty upload response"))
+        })?;
 
         let valid = raw.file_id.as_deref().map(|id| id != "-1").unwrap_or(true)
             && raw.photo_id.as_deref().map(|id| id != "-1").unwrap_or(true);
@@ -1015,6 +1067,39 @@ mod tests {
             "photoId": "123"
         }));
         assert!(raw2.ori_url.is_none());
+    }
+
+    #[test]
+    fn pick_final_raw_chon_chunk_cuoi_du_khi_ve_loon_xoon() {
+        // Upload song song: response về theo thứ tự hoàn thành, chunk cuối
+        // (id 3) có thể về TRƯỚC chunk giữa — kết quả vẫn phải là chunk 3
+        // (mang URL đầy đủ), không phải chunk về sau cùng.
+        let mk = |chunk_id: i64, url: &str| {
+            (
+                chunk_id,
+                RawUploadResponse::from_value(serde_json::json!({
+                    "chunkId": chunk_id,
+                    "fileId": "f1",
+                    "normalUrl": url,
+                })),
+            )
+        };
+        let got = pick_final_raw(
+            vec![mk(3, "https://cdn/cuoi"), mk(1, "https://cdn/dau"), mk(2, "https://cdn/giua")],
+            3,
+        )
+        .unwrap();
+        assert_eq!(got.chunk_id, 3);
+        assert_eq!(got.normal_url.as_deref(), Some("https://cdn/cuoi"));
+        // Thiếu chunk cuối -> fallback response về sau cùng.
+        let got2 = pick_final_raw(vec![mk(1, "https://cdn/dau"), mk(2, "https://cdn/giua")], 3)
+            .unwrap();
+        assert_eq!(got2.chunk_id, 2);
+        // Rỗng -> None (caller báo "Empty upload response").
+        assert!(pick_final_raw(vec![], 1).is_none());
+        // 1 chunk duy nhất -> chính nó.
+        let got3 = pick_final_raw(vec![mk(1, "https://cdn/only")], 1).unwrap();
+        assert_eq!(got3.chunk_id, 1);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
@@ -15,6 +16,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::context::ContextSession;
 use crate::core::utils::{decode_event_data, DecodedEventData};
 use crate::errors::{Result, ZaloApiError, ZaloError};
+use crate::models::r#enum::ThreadType;
 use crate::{zlog_error, zlog_info, zlog_verbose, zlog_warn};
 
 /// Close reasons matching the TypeScript implementation.
@@ -65,6 +67,14 @@ pub struct Listener {
     /// Reconnect after a close/error. Defaults to `true` (the historical
     /// behaviour); `listen()` sets it from `ListenOptions::retry_on_close`.
     retry_on_close: bool,
+    /// Sender vào socket đang mở — bot dùng để gửi frame WS (vd: xin tin
+    /// cũ). `None` khi chưa start hoặc đang nối lại; `connect_and_run` set
+    /// lại mỗi lần nối thành công, vòng lặp `start()` xóa khi socket rớt.
+    /// `std::sync::Mutex` (không phải tokio Mutex) để hàm gửi có thể là
+    /// sync, gọi được từ bất cứ context nào mà không lo block runtime.
+    out_tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// Đếm `req_id` cho frame WS gửi đi (JS: `req_${this.id++}`).
+    req_id: Arc<AtomicU64>,
 }
 
 impl Listener {
@@ -74,6 +84,8 @@ impl Listener {
             urls,
             stop_tx: None,
             retry_on_close: true,
+            out_tx: Arc::new(std::sync::Mutex::new(None)),
+            req_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -83,6 +95,77 @@ impl Listener {
     pub fn with_retry_on_close(mut self, retry_on_close: bool) -> Self {
         self.retry_on_close = retry_on_close;
         self
+    }
+
+    /// Xin tin nhắn cũ từ server qua WS (JS gốc `listen.js`
+    /// `requestOldMessages`: cmd 510 cho chat 1-1, 511 cho nhóm, subCmd 1,
+    /// data `{first: true, lastId, preIds: []}` + `req_id`). Server trả về
+    /// qua `ListenerEvent::OldMessages` (cmd 510/511 sub 1 — phía nhận đã
+    /// có sẵn, chỉ thiếu phía gửi nên bot trước đây không bao giờ xin
+    /// được lịch sử cũ, vd: /topchat chỉ merge tin server tự đẩy).
+    ///
+    /// `last_msg_id`: xin tiếp từ tin này trở về trước; `None` = từ mới
+    /// nhất. Lỗi khi socket chưa nối (chưa start / đang nối lại) — caller
+    /// chờ `ListenerEvent::Connected` rồi gọi lại.
+    pub fn request_old_messages(
+        &self,
+        thread_type: ThreadType,
+        last_msg_id: Option<&str>,
+    ) -> Result<()> {
+        let cmd = match thread_type {
+            ThreadType::User => 510,
+            ThreadType::Group => 511,
+        };
+        self.send_ws_request(cmd, last_msg_id)
+    }
+
+    /// Xin reaction cũ từ server qua WS (JS gốc `requestOldReactions`:
+    /// cmd 610 cho chat 1-1, 611 cho nhóm, cùng shape data như
+    /// `request_old_messages`). Server trả về qua `ListenerEvent::Reaction`.
+    pub fn request_old_reactions(
+        &self,
+        thread_type: ThreadType,
+        last_msg_id: Option<&str>,
+    ) -> Result<()> {
+        let cmd = match thread_type {
+            ThreadType::User => 610,
+            ThreadType::Group => 611,
+        };
+        self.send_ws_request(cmd, last_msg_id)
+    }
+
+    /// Gửi 1 frame WS kiểu "request" (cmd + subCmd 1 + data `{first,
+    /// lastId, preIds, req_id}`) — đúng shape `sendWs` của JS gốc.
+    fn send_ws_request(&self, cmd: u16, last_msg_id: Option<&str>) -> Result<()> {
+        let req_n = self.req_id.fetch_add(1, Ordering::Relaxed);
+        let payload = encode_payload(
+            1,
+            cmd,
+            1,
+            &serde_json::json!({
+                "first": true,
+                "lastId": last_msg_id,
+                "preIds": [],
+                "req_id": format!("req_{}", req_n),
+            }),
+        );
+        let tx = self
+            .out_tx
+            .lock()
+            .map_err(|_| {
+                ZaloError::Api(ZaloApiError::new("WebSocket sender lock poisoned"))
+            })?
+            .clone();
+        match tx {
+            Some(tx) => tx.send(payload).map_err(|_| {
+                ZaloError::Api(ZaloApiError::new(
+                    "WebSocket is not connected (listener stopped or reconnecting)",
+                ))
+            }),
+            None => Err(ZaloError::Api(ZaloApiError::new(
+                "WebSocket is not connected (listener not started or reconnecting)",
+            ))),
+        }
     }
 
     /// Start the listener and return a receiver for events.
@@ -105,6 +188,7 @@ impl Listener {
         let ctx = self.ctx.clone();
         let urls = self.urls.clone();
         let retry_on_close = self.retry_on_close;
+        let out_tx_handle = self.out_tx.clone();
         let mut consecutive_failures: u32 = 0;
         let last_connected_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
@@ -165,8 +249,14 @@ impl Listener {
                     cipher_key,
                     ctx.options.self_listen,
                     last_connected_at.clone(),
+                    out_tx_handle.clone(),
                 )
                 .await;
+                // Socket rớt: xóa sender để `request_old_messages` báo lỗi
+                // rõ ràng thay vì gửi vào kênh đã chết; lần nối sau set lại.
+                if let Ok(mut guard) = out_tx_handle.lock() {
+                    *guard = None;
+                }
 
                 match connect_result {
                     Ok(should_stop) => {
@@ -281,6 +371,7 @@ async fn connect_and_run(
     cipher_key: Arc<Mutex<Option<String>>>,
     self_listen: bool,
     last_connected_at: Arc<Mutex<Option<Instant>>>,
+    out_tx_handle: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
 ) -> Result<bool> {
     // Build request with headers matching the TypeScript client exactly.
     let mut request = ws_url
@@ -328,6 +419,11 @@ async fn connect_and_run(
 
     let (mut write, mut read) = ws_stream.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Mở sender cho `Listener::request_old_messages` /
+    // `request_old_reactions` dùng; vòng lặp `start()` xóa khi socket rớt.
+    if let Ok(mut guard) = out_tx_handle.lock() {
+        *guard = Some(out_tx.clone());
+    }
     let ping_interval_ms = get_ping_interval_ms(ctx);
     // Pong watchdog: if the server goes silent (no frames at all, not even a
     // pong) for twice the ping interval (min 120s), the socket is dead even
@@ -983,5 +1079,68 @@ mod tests {
         let stashed = ctx.file_done_stash.take("fid-7");
         assert!(stashed.is_some());
         assert_eq!(stashed.unwrap()["fileUrl"], "https://cdn/no-act");
+    }
+
+    #[test]
+    fn request_old_messages_gui_frame_dung_shape_js_khi_chua_noi() {
+        // Chưa start (không có socket) -> lỗi rõ ràng, không panic.
+        let listener = Listener::new(dummy_ctx(), vec!["wss://example.invalid".into()]);
+        assert!(listener
+            .request_old_messages(ThreadType::Group, None)
+            .is_err());
+        assert!(listener
+            .request_old_reactions(ThreadType::User, Some("123"))
+            .is_err());
+    }
+
+    #[test]
+    fn request_old_messages_gui_dung_cmd_va_data_nhu_js() {
+        // Gắn sender giả vào Listener rồi kiểm tra frame gửi đi: đúng cmd
+        // (511 nhóm / 510 chat 1-1), subCmd 1, data {first, lastId,
+        // preIds, req_id} như `sendWs` của JS gốc.
+        let listener = Listener::new(dummy_ctx(), vec!["wss://example.invalid".into()]);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        *listener.out_tx.lock().unwrap() = Some(tx);
+
+        listener
+            .request_old_messages(ThreadType::Group, Some("987654321"))
+            .unwrap();
+        let frame = rx.try_recv().expect("phai co 1 frame gui di");
+        let (version, cmd, sub_cmd) = decode_header(&frame).unwrap();
+        assert_eq!((version, cmd, sub_cmd), (1, 511, 1));
+        let data: Value = serde_json::from_slice(&frame[4..]).unwrap();
+        assert_eq!(data["first"], true);
+        assert_eq!(data["lastId"], "987654321");
+        assert_eq!(data["preIds"], serde_json::json!([]));
+        let req1 = data["req_id"].as_str().unwrap().to_string();
+        assert!(req1.starts_with("req_"));
+        let mut req_ids = vec![req1];
+
+        // Chat 1-1 -> cmd 510, lastId null khi không truyền.
+        listener.request_old_messages(ThreadType::User, None).unwrap();
+        let frame = rx.try_recv().expect("phai co frame thu 2");
+        let (_, cmd, sub_cmd) = decode_header(&frame).unwrap();
+        assert_eq!((cmd, sub_cmd), (510, 1));
+        let data: Value = serde_json::from_slice(&frame[4..]).unwrap();
+        assert!(data["lastId"].is_null());
+        req_ids.push(data["req_id"].as_str().unwrap().to_string());
+
+        // Reaction cũ: nhóm -> 611, 1-1 -> 610.
+        listener.request_old_reactions(ThreadType::Group, None).unwrap();
+        let frame = rx.try_recv().expect("phai co frame thu 3");
+        assert_eq!(decode_header(&frame).unwrap().1, 611);
+        let data: Value = serde_json::from_slice(&frame[4..]).unwrap();
+        req_ids.push(data["req_id"].as_str().unwrap().to_string());
+        listener
+            .request_old_reactions(ThreadType::User, Some("5"))
+            .unwrap();
+        let frame = rx.try_recv().expect("phai co frame thu 4");
+        assert_eq!(decode_header(&frame).unwrap().1, 610);
+        let data: Value = serde_json::from_slice(&frame[4..]).unwrap();
+        req_ids.push(data["req_id"].as_str().unwrap().to_string());
+        // req_id tăng dần, không trùng nhau.
+        let unique: std::collections::HashSet<&String> = req_ids.iter().collect();
+        assert_eq!(unique.len(), 4);
+        assert!(rx.try_recv().is_err(), "khong con frame thua");
     }
 }
