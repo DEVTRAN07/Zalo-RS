@@ -394,11 +394,13 @@ async fn send_uploaded_attachments(
             UploadAttachmentType::Image(img) => {
                 // ORIGINAL: mọi URL ảnh gửi đi lấy bản gốc
                 // (`UploadAttachmentImageResponse::original_url` = oriUrl
-                // server trả về, fallback normalUrl khi không có).
-                // Trước đây cả 3 field đều gán normal_url (bản Thường
-                // đã nén) nên ảnh gửi đi bị flatten về bản Thường.
-                // hdUrl/thumbUrl giữ nguyên: chỉ là bản xem trước/HD
-                // kèm theo, không phải ảnh chính người nhận mở.
+                // server trả về, nếu không có thì hdUrl — server không
+                // bao giờ trả oriUrl/fileUrl nhưng luôn trả hdUrl theo
+                // log live `[upload-diag]` — cuối cùng mới fallback
+                // normalUrl). Trước đây cả 3 field đều gán normal_url
+                // (bản Thường đã nén) nên ảnh gửi đi bị flatten về bản
+                // Thường. hdUrl/thumbUrl giữ nguyên: chỉ là bản xem
+                // trước/HD kèm theo, không phải ảnh chính người nhận mở.
                 let original_url = img.original_url();
                 let mut p = serde_json::json!({
                     "photoId": img.photo_id,

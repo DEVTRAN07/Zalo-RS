@@ -36,7 +36,8 @@ pub struct UploadAttachmentImageResponse {
     /// `photo_original/upload`, fallback `fileUrl` khi chunk response
     /// tự mang URL trực tiếp). Rỗng khi server không trả — caller dùng
     /// [`UploadAttachmentImageResponse::original_url`] để fallback về
-    /// `normal_url`, nên hành vi cũ giữ nguyên khi không có URL gốc.
+    /// `hd_url` rồi mới tới `normal_url`, nên hành vi cũ giữ nguyên khi
+    /// không có URL gốc.
     /// Thêm field này để ảnh gửi đi giữ dạng gốc thay vì bị flatten
     /// về bản Thường (trước đây `send_uploaded_attachments` gán
     /// `oriUrl`/`rawUrl` = `normal_url`).
@@ -57,16 +58,23 @@ pub struct UploadAttachmentImageResponse {
 
 impl UploadAttachmentImageResponse {
     /// URL ảnh gửi đi: bản GỐC (`ori_url`) khi server trả về, nếu
-    /// không thì bản Thường (`normal_url`). Đây là điểm duy nhất quyết
-    /// định chất lượng ảnh gửi — mọi đường gửi ảnh (nhóm + riêng) đều
-    /// đi qua đây, nên ảnh bot gửi luôn là bản gốc khi có.
+    /// không thì bản HD (`hd_url` — link chất lượng cao nhất server
+    /// thực tế trả về: log live `[upload-diag]` 2026-11-28 chứng minh
+    /// server KHÔNG BAO GIỜ trả `oriUrl`/`fileUrl` nhưng LUÔN trả
+    /// `hdUrl`), cuối cùng mới fallback bản Thường (`normal_url`).
+    /// Đây là điểm duy nhất quyết định chất lượng ảnh gửi — mọi đường
+    /// gửi ảnh (nhóm + riêng) đều đi qua đây, nên ảnh bot gửi luôn là
+    /// bản chất lượng cao nhất có thể thay vì bị flatten về bản Thường.
     pub fn original_url(&self) -> &str {
         let ori = self.ori_url.trim();
-        if ori.is_empty() {
-            self.normal_url.as_str()
-        } else {
-            ori
+        if !ori.is_empty() {
+            return ori;
         }
+        let hd = self.hd_url.trim();
+        if !hd.is_empty() {
+            return hd;
+        }
+        self.normal_url.as_str()
     }
 }
 
@@ -120,7 +128,8 @@ struct RawUploadResponse {
     thumb_url: Option<String>,
     /// URL ảnh gốc (`oriUrl`) nếu server trả về trong response upload.
     /// Không phải lúc nào cũng có — thiếu thì đường gửi fallback về
-    /// `normal_url` qua `UploadAttachmentImageResponse::original_url`.
+    /// `hd_url` rồi mới tới `normal_url` qua
+    /// `UploadAttachmentImageResponse::original_url`.
     ori_url: Option<String>,
     /// Direct file URL if the chunk response itself carries one
     /// (`fileUrl`/`file_url`). Used as a fallback when the `file_done`
@@ -941,6 +950,40 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(blank_ori.original_url(), "https://cdn/n.jpg");
+        // Không có oriUrl nhưng có hdUrl -> dùng hdUrl (server live
+        // không bao giờ trả oriUrl/fileUrl nhưng luôn trả hdUrl —
+        // log `[upload-diag]` 2026-11-28).
+        let no_ori_with_hd = UploadAttachmentImageResponse {
+            normal_url: "https://cdn/n.jpg".to_string(),
+            ori_url: String::new(),
+            hd_url: "https://cdn/h.jpg".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(no_ori_with_hd.original_url(), "https://cdn/h.jpg");
+        // oriUrl trắng + có hdUrl -> dùng hdUrl.
+        let blank_ori_with_hd = UploadAttachmentImageResponse {
+            normal_url: "https://cdn/n.jpg".to_string(),
+            ori_url: "   ".to_string(),
+            hd_url: "https://cdn/h.jpg".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(blank_ori_with_hd.original_url(), "https://cdn/h.jpg");
+        // Có cả oriUrl lẫn hdUrl -> oriUrl vẫn thắng.
+        let both = UploadAttachmentImageResponse {
+            normal_url: "https://cdn/n.jpg".to_string(),
+            ori_url: "https://cdn/o.jpg".to_string(),
+            hd_url: "https://cdn/h.jpg".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(both.original_url(), "https://cdn/o.jpg");
+        // Không có oriUrl, hdUrl trắng -> fallback bản Thường.
+        let blank_hd = UploadAttachmentImageResponse {
+            normal_url: "https://cdn/n.jpg".to_string(),
+            ori_url: String::new(),
+            hd_url: "   ".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(blank_hd.original_url(), "https://cdn/n.jpg");
     }
 
     #[test]
@@ -955,7 +998,8 @@ mod tests {
         }));
         assert_eq!(raw.ori_url.as_deref(), Some("https://cdn/o.jpg"));
         assert_eq!(raw.normal_url.as_deref(), Some("https://cdn/n.jpg"));
-        // Không có oriUrl -> None (đường gửi fallback về normal_url).
+        // Không có oriUrl -> None (đường gửi fallback về hd_url rồi mới
+        // tới normal_url).
         let raw2 = RawUploadResponse::from_value(serde_json::json!({
             "normalUrl": "https://cdn/n.jpg",
             "photoId": "123"
