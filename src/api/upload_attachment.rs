@@ -126,6 +126,10 @@ struct RawUploadResponse {
     /// (`fileUrl`/`file_url`). Used as a fallback when the `file_done`
     /// WS event never arrives, so the upload does not end with an empty URL.
     file_url: Option<String>,
+    /// Danh sách tên key của object `data` trong chunk response (chỉ tên
+    /// key, không giá trị) — phục vụ log chẩn đoán vụ ảnh ra HD thay vì
+    /// ORIGINAL: xem server có trả `oriUrl` không.
+    data_keys: Vec<String>,
 }
 
 impl RawUploadResponse {
@@ -178,6 +182,10 @@ impl RawUploadResponse {
                 .or_else(|| value.get("file_url"))
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string),
+            data_keys: value
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default(),
         }
     }
 }
@@ -793,6 +801,24 @@ async fn upload_attachment_internal(
 
         match kind {
             FileKind::Image => {
+                // LOG CHẨN ĐOÁN (tạm thời, vụ ảnh ra HD thay vì ORIGINAL):
+                // ghi tên key của chunk response cuối + oriUrl có về không.
+                // Chỉ log TÊN key, không log giá trị URL. Mức warn để chắc
+                // chắn hiện trong log live của bot (bot mặc định chỉ hiện
+                // ERROR khi không set RUST_LOG; user đang thấy cả WARN).
+                // Khi chẩn đoán xong thì xoá log này (hoặc hạ xuống debug).
+                let has = |v: &Option<String>| {
+                    v.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+                };
+                log::warn!(
+                    "[upload-diag] chunk cuoi upload anh: keys={:?} oriUrl={} fileUrl={} normalUrl={} hdUrl={} thumbUrl={}",
+                    raw.data_keys,
+                    has(&raw.ori_url),
+                    has(&raw.file_url),
+                    has(&raw.normal_url),
+                    has(&raw.hd_url),
+                    has(&raw.thumb_url),
+                );
                 results.push(UploadAttachmentType::Image(UploadAttachmentImageResponse {
                     normal_url: raw.normal_url.unwrap_or_default(),
                     // Giữ URL gốc: ưu tiên oriUrl server trả về, rồi
